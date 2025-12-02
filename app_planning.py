@@ -277,15 +277,15 @@ with st.sidebar.form("plan_form"):
     dls_label = "deg/30m" if unit_sys == "Metric" else "deg/100ft"
     
     c1, c2 = st.columns(2)
-    r_floor = c1.number_input(f"Rotary Table ({u_label})", 6.1); r_elev = c2.number_input(f"Cellar Elev", 19.46)
-    surf_n = c1.number_input("Surf N", 9000000.0); surf_e = c2.number_input("Surf E", 400000.0)
+    r_floor = c1.number_input(f"Rotary Table ({u_label})"); r_elev = c2.number_input(f"Cellar Elev")
+    surf_n = c1.number_input("Surf N"); surf_e = c2.number_input("Surf E")
     
     st.markdown("---")
-    tgt_n = c1.number_input("Target N", 9000400.0); tgt_e = c2.number_input("Target E", 400400.0)
-    tgt_tvdss = st.number_input(f"Target TVDSS ({u_label})", 2200.0)
+    tgt_n = c1.number_input("Target N"); tgt_e = c2.number_input("Target E")
+    tgt_tvdss = st.number_input(f"Target TVDSS ({u_label})")
     
     c3, c4 = st.columns(2)
-    kop = c3.number_input(f"KOP ({u_label})", 500.0); dls = c4.number_input(f"DLS", 3.0)
+    kop = c3.number_input(f"KOP ({u_label})"); dls = c4.number_input(f"DLS")
     
     plan_submit = st.form_submit_button("🚀 CALCULATE PLAN", type="primary")
 
@@ -318,7 +318,7 @@ with st.sidebar.expander("🛠️ Casing & Formation Manager", expanded=False):
 with st.sidebar.expander("📉 Actual & Prescription (Correction)", expanded=False):
     st.caption("Paste Actual Survey (MD Inc Azi TVD N E)")
     actual_txt = st.text_area("Actual Data:", height=100)
-    corr_len = st.number_input(f"Correction Length ({u_label})", 300.0)
+    corr_len = st.number_input(f"Correction Length ({u_label})")
     
     if st.button("Run Prescriptive Analysis"):
         if 'Plan' in st.session_state['layers']:
