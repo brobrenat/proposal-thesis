@@ -10,7 +10,7 @@ import re
 
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="DSS J-Type Well Planner", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="DSS Well Master Ultimate", layout="wide", page_icon="🏗️")
 
 # ==========================================
 # 1. ENGINE & LOGIC
@@ -74,9 +74,11 @@ class SmartPlanner:
         return df_metric, azi, hold
 
     def _generate_path_mcm(self, kop, dls, hold_inc, azi, target_tvd, rkb_val, surf_n, surf_e):
+        # Generate Survey Points
         step = 10.0 
         mds, incs, azis = [0], [0], [azi]
         
+        # Vertical
         curr_md = 0
         while curr_md < kop:
             curr_md += step
@@ -84,6 +86,7 @@ class SmartPlanner:
             mds.append(curr_md); incs.append(0); azis.append(azi)
             if curr_md == kop: break
             
+        # Build
         radius = (180/np.pi) * (30.0/dls)
         build_len = np.radians(hold_inc) * radius
         eob_md = kop + build_len
@@ -96,9 +99,9 @@ class SmartPlanner:
             mds.append(curr_md); incs.append(frac * hold_inc); azis.append(azi)
             if curr_md == eob_md: break
             
+        # Hold
         tvd_eob = kop + (radius * np.sin(np.radians(hold_inc)))
         rem_tvd = target_tvd - tvd_eob
-        
         if rem_tvd > 0:
             hold_len = rem_tvd / np.cos(np.radians(hold_inc))
             target_md = eob_md + hold_len
@@ -110,6 +113,7 @@ class SmartPlanner:
                 mds.append(curr_md); incs.append(hold_inc); azis.append(azi)
                 if curr_md == target_md: break
         
+        # Hitung Koordinat pakai MCM Engine
         df = self.engine.calculate_trajectory(mds, incs, azis, surf_n, surf_e, 0)
         
         df['Section'] = 'Plan'
@@ -117,70 +121,51 @@ class SmartPlanner:
         return df, azi, hold_inc
 
     def calculate_correction_path(self, actual_df, plan_df, correction_len):
-        # 1. Anchor to Last Actual Point (Ensure Continuity)
         last_act = actual_df.iloc[-1]
+        target_md = last_act['MD'] + correction_len
+        
+        # --- FIX: Variable name corrected here ---
+        plan_segment = plan_df[plan_df['MD'] >= target_md]
+        
+        if plan_segment.empty: 
+            target_row = plan_df.iloc[-1] 
+        else: 
+            target_row = plan_segment.iloc[0]
+        # -----------------------------------------
+        
+        target_pos = np.array([target_row['N'], target_row['E'], target_row['TVD']])
         start_pos = np.array([last_act['N'], last_act['E'], last_act['TVD']])
         start_inc = last_act['Inc']
         start_azi = last_act['Azi']
-        start_md = last_act['MD']
-
-        # 2. Define Target Point on Plan
-        target_md = start_md + correction_len
-        plan_seg = plan_df[plan_df['MD'] >= target_md]
         
-        if plan_seg.empty: 
-            target_row = plan_df.iloc[-1] # Fallback to TD
-        else: 
-            target_row = plan_segment.iloc[0]
-            
-        target_pos = np.array([target_row['N'], target_row['E'], target_row['TVD']])
-        
-        # 3. Optimization Function
-        def simulate_section(params):
-            # params = [build_rate, turn_rate]
-            build_rate, turn_rate = params
-            
-            # Simulate Path from Start Point
-            sim_step = correction_len / 10.0 # Coarse step for speed
-            n_steps = 10
-            
+        def simulate(params):
+            bur, tr = params
+            sim_step = correction_len / 5.0
             curr_n, curr_e, curr_tvd = start_pos
             curr_inc, curr_azi = start_inc, start_azi
             
-            d_inc = (build_rate / self.dls_ref) * sim_step
-            d_azi = (turn_rate / self.dls_ref) * sim_step
+            d_inc = (bur / self.dls_ref) * sim_step
+            d_azi = (tr / self.dls_ref) * sim_step
             
-            for _ in range(n_steps):
-                next_inc = curr_inc + d_inc
-                next_azi = curr_azi + d_azi
-                
-                avg_inc = np.radians((curr_inc + next_inc)/2)
-                avg_azi = np.radians((curr_azi + next_azi)/2)
-                
-                # Tangential approximation for speed in optimizer
+            for _ in range(5):
+                avg_inc = np.radians(curr_inc + d_inc/2)
+                avg_azi = np.radians(curr_azi + d_azi/2)
                 curr_tvd += sim_step * np.cos(avg_inc)
                 curr_n += sim_step * np.sin(avg_inc) * np.cos(avg_azi)
                 curr_e += sim_step * np.sin(avg_inc) * np.sin(avg_azi)
+                curr_inc += d_inc; curr_azi += d_azi
                 
-                curr_inc, curr_azi = next_inc, next_azi
-            
-            # Objective: Minimize Distance to Target XYZ
             return np.sum((np.array([curr_n, curr_e, curr_tvd]) - target_pos)**2)
 
-        # 4. Run Optimization
-        # Wide bounds to allow aggressive corrections if needed
-        res = minimize(simulate_section, [0, 0], bounds=[(-15, 15), (-15, 15)], method='Nelder-Mead')
+        res = minimize(simulate, [0, 0], bounds=[(-15, 15), (-15, 15)], method='Nelder-Mead')
         best_bur, best_turn = res.x
         
-        # 5. Generate High-Res Path (Visualization)
-        # Crucial: Start exactly from last actual point
-        step = 5.0
+        # Generate Detail Path
+        step = 10.0
         n_steps = int(correction_len / step)
         if n_steps < 1: n_steps = 1
         
-        # Initialize arrays with Start Point
-        mds, incs, azis = [start_md], [start_inc], [start_azi]
-        
+        mds, incs, azis = [last_act['MD']], [last_act['Inc']], [last_act['Azi']]
         d_inc = (best_bur / self.dls_ref) * step
         d_azi = (best_turn / self.dls_ref) * step
         
@@ -189,22 +174,17 @@ class SmartPlanner:
             incs.append(incs[-1] + d_inc)
             azis.append(azis[-1] + d_azi)
             
-        # Use MCM Engine to calculate coords, anchoring to Start XYZ
-        # Note: We pass start_n, start_e, start_tvd to ensure it continues exactly where actual left off
-        df_corr = self.engine.calculate_trajectory(
-            np.array(mds), np.array(incs), np.array(azis),
-            start_n=start_pos[0], start_e=start_pos[1], start_tvd=start_pos[2]
-        )
-        
-        # Fix TVDSS
+        df_corr = self.engine.calculate_trajectory(mds, incs, azis, last_act['N'], last_act['E'], last_act['TVD'])
         df_corr['TVDSS'] = df_corr['TVD'] - (self.rkb * (self.ft_to_m if self.unit=='Imperial' else 1))
         df_corr['Section'] = 'Correction'
         
-        # Calculate Resultant DLS
-        avg_inc_rad = np.radians(start_inc + (incs[-1] - start_inc)/2)
-        total_dls = np.sqrt(best_bur**2 + (best_turn * np.sin(avg_inc_rad))**2)
+        avg_inc = np.radians(last_act['Inc'])
+        total_dls = np.sqrt(best_bur**2 + (best_turn * np.sin(avg_inc))**2)
         
-        return df_corr, total_dls, best_bur, best_turn
+        # Toolface Calc
+        toolface = np.degrees(np.arctan2(best_turn, best_bur)) % 360
+
+        return df_corr, total_dls, best_bur, best_turn, toolface
 
     def calculate_extension(self, current_df, add_length, target_inc, target_azi):
         last = current_df.iloc[-1]
@@ -230,16 +210,16 @@ class SmartPlanner:
 
 
 class DrillingEngine:
+    """ 
+    Core Minimum Curvature Algorithm (API RP 78)
+    """
     def __init__(self, unit, dls_ref):
         self.unit = unit
         self.dls_ref = dls_ref
         
     def calculate_trajectory(self, md, inc, azi, start_n, start_e, start_tvd):
         n = len(md)
-        # Initialize with zeros
         tvd = np.zeros(n); n_c = np.zeros(n); e_c = np.zeros(n); dls = np.zeros(n)
-        
-        # Explicitly set start point
         tvd[0], n_c[0], e_c[0] = start_tvd, start_n, start_e
         
         inc_rad = np.radians(inc)
@@ -280,11 +260,13 @@ def calculate_economics(df):
 def parse_trajectory_data(text_data, rkb, surf_n, surf_e, engine, azi_corr=0.0):
     if not text_data.strip(): return None
     try:
+        # 1. SMART PARSER (Detect separator)
         data = StringIO(text_data)
-        try: df = pd.read_csv(data, sep=None, engine='python') 
+        try: df = pd.read_csv(data, sep=None, engine='python') # Auto-detect sep
         except: 
-            data.seek(0); df = pd.read_csv(data, sep='\t') 
+            data.seek(0); df = pd.read_csv(data, sep='\t') # Fallback tab
 
+        # 2. CLEAN HEADERS
         df.columns = df.columns.str.upper().str.replace(r"[\(\[].*?[\)\]]", "", regex=True).str.strip()
         col_map = {
             'MEASURED DEPTH':'MD', 'INCLINATION':'Inc', 'AZIMUTH':'Azi', 
@@ -300,13 +282,19 @@ def parse_trajectory_data(text_data, rkb, surf_n, surf_e, engine, azi_corr=0.0):
         if not all(c in df.columns for c in req): 
             return "MISSING_COLS: Required at least MD, Inc, Azi"
         
+        # --- AUTO-CALCULATE COORDINATES IF MISSING ---
         if 'N' not in df.columns or 'E' not in df.columns or 'TVD' not in df.columns:
+            # Apply Azimuth Correction ONLY if re-calculating
             df['Azi'] = (df['Azi'] + azi_corr) % 360
+            
             df = df.sort_values('MD').reset_index(drop=True)
+            
+            # AUTO-ANCHOR TO SURFACE (Tie-in 0)
             if df['MD'].iloc[0] > 0:
                 row0 = pd.DataFrame({'MD': [0], 'Inc': [0], 'Azi': [0]})
                 df = pd.concat([row0, df], ignore_index=True)
             
+            # RE-COMPUTE using Engine (MCM)
             df_calc = engine.calculate_trajectory(
                 df['MD'].values, df['Inc'].values, df['Azi'].values,
                 start_n=surf_n, start_e=surf_e, start_tvd=0
@@ -315,6 +303,7 @@ def parse_trajectory_data(text_data, rkb, surf_n, surf_e, engine, azi_corr=0.0):
             df_calc['TVDSS'] = df_calc['TVD'] - rkb
             return df_calc
         
+        # If data already has coords, use them but fix headers if needed
         if 'TVDSS' not in df.columns: df['TVDSS'] = df['TVD'] - rkb
         if 'VS' not in df.columns: df['VS'] = np.sqrt((df['N'] - surf_n)**2 + (df['E'] - surf_e)**2)
         
@@ -359,14 +348,14 @@ if 'autofill_data' in st.session_state:
 
 st.sidebar.title("🎛️ DSS Command Center")
 
+# --- AUTO-FILL EXPANDER ---
 with st.sidebar.expander("⚡ Quick Import (Auto-Fill)", expanded=False):
     st.caption("Paste full data to extract parameters. **Requires: N, E, TVD**")
     paste_data = st.text_area("Paste Data:", height=100)
     if st.button("⚡ Extract & Apply"):
         try:
-            # Pass None engine for extraction
-            df_temp = parse_trajectory_data(paste_data, 0, 0, 0, None) 
-            
+            temp_engine = DrillingEngine('Metric', 30.0)
+            df_temp = parse_trajectory_data(paste_data, 0, 0, 0, temp_engine) 
             if isinstance(df_temp, pd.DataFrame) and {'N', 'E', 'TVD'}.issubset(df_temp.columns):
                 s_n = df_temp['N'].iloc[0]; s_e = df_temp['E'].iloc[0]
                 t_n = df_temp['N'].iloc[-1]; t_e = df_temp['E'].iloc[-1]; t_tvd = df_temp['TVD'].iloc[-1]
@@ -448,7 +437,7 @@ with st.sidebar.expander("📉 Actual / Correction"):
     if st.button("🎲 Demo Actual"):
         st.session_state['act_txt'] = "MD Inc Azi\n0 0 0\n500 0 0\n600 2 45\n1000 12 48"
     act_txt = st.text_area("Actual Data:", value=st.session_state.get('act_txt', ''))
-    corr_len = st.number_input("Correction Len",value=300.0)
+    corr_len = st.number_input("Correction Len", value=300.0)
     
     if st.button("Run Prescription"):
         if 'Plan' in st.session_state['layers']:
@@ -460,9 +449,10 @@ with st.sidebar.expander("📉 Actual / Correction"):
                 st.session_state['layers']['Actual'] = {'df': df_act, 'color': '#FF0000', 'show': True}
                 planner = meta['planner']
                 df_plan = st.session_state['layers']['Plan']['df']
-                df_corr, dls, bur, turn = planner.calculate_correction_path(df_act, df_plan, corr_len)
+                # UNPACK 5 VARIABLES: df_corr, total_dls, req_bur, best_turn, toolface
+                df_corr, total_dls, req_bur, best_turn, tf = planner.calculate_correction_path(df_act, df_plan, corr_len)
                 st.session_state['layers']['Correction'] = {'df': df_corr, 'color': '#00FF00', 'show': True}
-                st.session_state['prescription'] = {'bur': bur, 'turn': turn, 'dls': dls, 'len': corr_len}
+                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf}
             else: st.error(df_act)
 
 # --- OFFSET WELLS ---
@@ -541,7 +531,7 @@ if 'Plan' in st.session_state['layers']:
 
     if 'prescription' in st.session_state and st.session_state['layers'].get('Correction', {}).get('show'):
         p = st.session_state['prescription']
-        st.info(f"💡 **PRESCRIPTION:** {('BUILD' if p['bur']>0 else 'DROP')} {abs(p['bur']):.2f} {dls_label} , TURN {('RIGHT' if p['turn']>0 else 'LEFT')} {abs(p['turn']):.2f} {dls_label}")
+        st.info(f"💡 **PRESCRIPTION:** {('BUILD' if p['bur']>0 else 'DROP')} {abs(p['bur']):.2f} {dls_label} , TURN {('RIGHT' if p['turn']>0 else 'LEFT')} {abs(p['turn']):.2f} {dls_label}, Toolface: {p['tf']:.0f}°")
 
     tab1, tab2, tab3 = st.tabs(["🌍 3D View", "📐 2D Views", "📋 Data"])
     
