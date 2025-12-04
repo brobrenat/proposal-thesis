@@ -75,7 +75,7 @@ class SmartPlanner:
 
     def _generate_path_mcm(self, kop, dls, hold_inc, azi, target_tvd, rkb_val, surf_n, surf_e):
         # Generate Survey Points
-        step = 10.0 
+        step = 1.0 
         mds, incs, azis = [0], [0], [azi]
         
         # Vertical
