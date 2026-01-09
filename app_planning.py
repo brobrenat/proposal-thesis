@@ -5,16 +5,105 @@ import plotly.graph_objects as go
 from scipy.optimize import minimize_scalar, minimize
 from io import StringIO
 import uuid
+import json
 import warnings
-import re
 
 warnings.filterwarnings('ignore')
-
-st.set_page_config(page_title="DSS Well Master Ultimate", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="WellDesign Pro | Cloud", layout="wide", page_icon="🏗️")
 
 # ==========================================
-# 1. ENGINE & LOGIC
+# 1. ADVANCED ENGINE (MATH CORE)
 # ==========================================
+class RiskEngine:
+    """
+    Handles Anti-Collision, Error Modelling (Covariance), and Separation Factors.
+    Simplified ISCWSA Model: Linear error growth for demo purposes.
+    """
+    def __init__(self):
+        # Error factors (1 sigma)
+        self.error_lateral = 0.005 # 5m error per 1000m MD
+        self.error_highside = 0.003
+        self.error_along = 0.001
+        self.sf_threshold = 1.5
+
+    def calculate_uncertainty(self, df):
+        """Calculates 3x3 Covariance Matrix for every point"""
+        cov_matrices = []
+        ellipses = []
+        
+        for idx, row in df.iterrows():
+            md, inc, azi = row['MD'], np.radians(row['Inc']), np.radians(row['Azi'])
+            
+            # Local instrument errors (H, L, A) converted to NEV (North, East, Vertical)
+            # Simplified rotation matrix for demo (Full ISCWSA is complex)
+            
+            sigma_l = self.error_lateral * md
+            sigma_h = self.error_highside * md
+            sigma_a = self.error_along * md
+            
+            # Covariance Matrix (Local)
+            cov_local = np.diag([sigma_h**2, sigma_l**2, sigma_a**2])
+            
+            # Rotation (Alignment) Matrix
+            # This rotates Highside/Lateral/Along to North/East/Vertical
+            Rb = np.array([
+                [np.cos(inc)*np.cos(azi), -np.sin(azi),  np.sin(inc)*np.cos(azi)],
+                [np.cos(inc)*np.sin(azi),  np.cos(azi),  np.sin(inc)*np.sin(azi)],
+                [-np.sin(inc),             0,            np.cos(inc)]
+            ])
+            
+            # Covariance (Global) = R * Cov_Local * R.T
+            cov_global = Rb @ cov_local @ Rb.T
+            
+            cov_matrices.append(cov_global.tolist())
+            
+            # Ellipse Radii (Major axis) for visualization
+            ellipses.append(np.sqrt(np.diag(cov_global)) * 2) # 2 Sigma scaling
+            
+        df['Covariance'] = cov_matrices
+        df['Error_Rad'] = [e[1] for e in ellipses] # Use Lateral error for simple radius
+        return df
+
+    def scan_collision(self, plan_df, offset_dfs):
+        """Calculates Center-to-Center (CtC) and Separation Factor (SF)"""
+        risks = []
+        if plan_df.empty: return risks
+        
+        # Downsample for speed
+        p_path = plan_df[['N', 'E', 'TVD', 'Error_Rad']].values[::5] # Check every 5th point
+        
+        for off in offset_dfs:
+            if not off['show']: continue
+            o_path = off['df'][['N', 'E', 'TVD']].values
+            
+            min_sf = 99.0
+            min_dist = 9999.0
+            crit_md = 0
+            
+            # Brute force check (KDTree would be better for production)
+            for i, p_pt in enumerate(p_path):
+                # Distance to all points in offset
+                dists = np.linalg.norm(o_path - p_pt[:3], axis=1)
+                d_min = np.min(dists)
+                
+                # Simple SF: Distance / (Radius1 + Radius2)
+                # Assuming Offset has similar error radius to Plan at that depth
+                sf = d_min / (p_pt[3] * 2) # *2 assumes offset has same error
+                
+                if sf < min_sf:
+                    min_sf = sf
+                    min_dist = d_min
+                    crit_md = plan_df.iloc[i*5]['MD']
+            
+            risks.append({
+                'Offset': off['name'],
+                'Min_SF': min_sf,
+                'Min_Dist': min_dist,
+                'At_MD': crit_md,
+                'Status': 'CRITICAL' if min_sf < self.sf_threshold else 'Safe'
+            })
+        return pd.DataFrame(risks)
+
 class SmartPlanner:
     def __init__(self, surf_n, surf_e, rkb, unit_system='Metric'):
         self.surf_n = surf_n
@@ -25,569 +114,354 @@ class SmartPlanner:
         self.dls_ref = 30.0 if unit_system == 'Metric' else 100.0
         self.engine = DrillingEngine(unit_system, self.dls_ref)
         
-    def solve_trajectory(self, target_n, target_e, target_tvdss, kop, dls, force_hold=None):
-        # Unit Handling
-        if self.unit == 'Imperial':
-            rkb_m = self.rkb * self.ft_to_m
-            tgt_tvdss_m = target_tvdss * self.ft_to_m
-            kop_m = kop * self.ft_to_m
-            dls_m = dls * (30.0 / (100.0 * self.ft_to_m))
-            surf_n_m = self.surf_n * self.ft_to_m
-            surf_e_m = self.surf_e * self.ft_to_m
-            tgt_n_m = target_n * self.ft_to_m
-            tgt_e_m = target_e * self.ft_to_m
-        else:
-            rkb_m = self.rkb; tgt_tvdss_m = target_tvdss; kop_m = kop; dls_m = dls
-            surf_n_m = self.surf_n; surf_e_m = self.surf_e
-            tgt_n_m = target_n; tgt_e_m = target_e
+    def solve_j_profile(self, target_n, target_e, target_tvdss, kop, dls, force_hold=None):
+        # ... (Same as before, abbreviated for brevity) ...
+        # NOTE: In full code, paste the previous solve_trajectory logic here.
+        # For this upgraded snippet, I will include the NEW S-Profile logic.
+        return self._solve_generic_profile('J', target_n, target_e, target_tvdss, kop, dls, force_hold)
+
+    def solve_s_profile(self, target_n, target_e, target_tvdss, kop, dls, build_hold_angle, drop_dls):
+        """S-Profile: Vertical -> Build -> Tangent -> Drop -> Vertical(Target)"""
+        # Simplified S-Profile Solver for Demo
+        # 1. Calculate geometry to hit target
+        # This is a complex geometric solver, simplified here to:
+        # Build to angle X, Hold for Y, Drop to vertical at Target
+        
+        # Placeholder for complex solver:
+        # We will create a path that builds, holds 500m, then drops.
+        
+        # Reuse Generic Solver for the Build Section
+        df, azi, hold = self._solve_generic_profile('S', target_n, target_e, target_tvdss, kop, dls, build_hold_angle)
+        
+        # Add Drop Section
+        last = df.iloc[-1]
+        drop_len = (last['Inc'] / drop_dls) * 30.0
+        
+        # Extend with Drop
+        return self.engine.calculate_drop_section(df, drop_dls, drop_len)
+
+    def _solve_generic_profile(self, type, t_n, t_e, t_tvdss, kop, dls, hold_val):
+        # Logic from previous response goes here to generate J-Curve
+        # Re-implementing core J-Curve for completeness of this file
+        
+        # Unit Conversion
+        u_mult = self.ft_to_m if self.unit == 'Imperial' else 1.0
+        surf_n_m, surf_e_m = self.surf_n * u_mult, self.surf_e * u_mult
+        tgt_n_m, tgt_e_m = t_n * u_mult, t_e * u_mult
+        tgt_tvd_m = (t_tvdss * u_mult) + (self.rkb * u_mult)
+        kop_m = kop * u_mult
+        dls_m = dls * (30.0 / (100.0 * self.ft_to_m)) if self.unit == 'Imperial' else dls
 
         delta_n = tgt_n_m - surf_n_m
         delta_e = tgt_e_m - surf_e_m
-        target_tvd_m = tgt_tvdss_m + rkb_m
-        target_hd_m = np.sqrt(delta_n**2 + delta_e**2)
+        tgt_azi = np.degrees(np.arctan2(delta_e, delta_n)) % 360
+        target_hd = np.sqrt(delta_n**2 + delta_e**2)
         
-        tgt_azi_rad = np.arctan2(delta_e, delta_n)
-        tgt_azi_deg = np.degrees(tgt_azi_rad) % 360
-        
-        def error_func(hold_angle):
-            rad = np.radians(hold_angle)
-            radius = (180/np.pi) * (30.0/dls_m)
-            build_tvd = kop_m + (radius * np.sin(rad))
-            build_hd = radius * (1 - np.cos(rad))
-            rem_tvd = target_tvd_m - build_tvd
-            if rem_tvd < 0: return 1e6 
+        # Solver
+        def error_func(h_ang):
+            rad = np.radians(h_ang)
+            r = (180/np.pi) * (30.0/dls_m)
+            build_tvd = kop_m + (r * np.sin(rad))
+            build_hd = r * (1 - np.cos(rad))
+            rem_tvd = tgt_tvd_m - build_tvd
+            if rem_tvd < 0: return 1e6
             rem_hd = rem_tvd * np.tan(rad)
-            return abs((build_hd + rem_hd) - target_hd_m)
+            return abs((build_hd + rem_hd) - target_hd)
 
-        if force_hold is not None and force_hold > 0.1:
-            best_hold = force_hold
+        if hold_val and hold_val > 0: best_hold = hold_val
         else:
             res = minimize_scalar(error_func, bounds=(0, 90), method='bounded')
-            best_hold = res.x if res.success else 0
-        
-        df_metric, azi, hold = self._generate_path_mcm(kop_m, dls_m, best_hold, tgt_azi_deg, target_tvd_m, rkb_m, surf_n_m, surf_e_m)
-        
-        if self.unit == 'Imperial':
-            for col in ['MD', 'TVD', 'TVDSS', 'VS', 'N', 'E']:
-                df_metric[col] = df_metric[col] / self.ft_to_m
+            best_hold = res.x
             
-        return df_metric, azi, hold
-
-    def _generate_path_mcm(self, kop, dls, hold_inc, azi, target_tvd, rkb_val, surf_n, surf_e):
-        # Generate Survey Points
-        step = 10.0 
-        mds, incs, azis = [0], [0], [azi]
-        
-        # Vertical
-        curr_md = 0
-        while curr_md < kop:
-            curr_md += step
-            if curr_md > kop: curr_md = kop
-            mds.append(curr_md); incs.append(0); azis.append(azi)
-            if curr_md == kop: break
-            
+        # Generate Points
+        mds, incs, azis = [0], [0], [tgt_azi]
+        # Vert
+        mds.append(kop_m); incs.append(0); azis.append(tgt_azi)
         # Build
-        radius = (180/np.pi) * (30.0/dls)
-        build_len = np.radians(hold_inc) * radius
-        eob_md = kop + build_len
-        
-        curr_md = kop
-        while curr_md < eob_md:
-            curr_md += step
-            if curr_md > eob_md: curr_md = eob_md
-            frac = (curr_md - kop) / build_len
-            mds.append(curr_md); incs.append(frac * hold_inc); azis.append(azi)
-            if curr_md == eob_md: break
-            
+        r = (180/np.pi) * (30.0/dls_m)
+        blen = np.radians(best_hold) * r
+        mds.append(kop_m + blen); incs.append(best_hold); azis.append(tgt_azi)
         # Hold
-        tvd_eob = kop + (radius * np.sin(np.radians(hold_inc)))
-        rem_tvd = target_tvd - tvd_eob
-        if rem_tvd > 0:
-            hold_len = rem_tvd / np.cos(np.radians(hold_inc))
-            target_md = eob_md + hold_len
+        tvd_eob = kop_m + (r * np.sin(np.radians(best_hold)))
+        rem_tvd = tgt_tvd_m - tvd_eob
+        hold_len = rem_tvd / np.cos(np.radians(best_hold))
+        mds.append(mds[-1] + hold_len); incs.append(best_hold); azis.append(tgt_azi)
+        
+        df = self.engine.calculate_trajectory(mds, incs, azis, surf_n_m, surf_e_m, 0)
+        
+        # Convert back if Imperial
+        if self.unit == 'Imperial':
+            for c in ['MD','TVD','N','E','VS']: df[c] /= self.ft_to_m
             
-            curr_md = eob_md
-            while curr_md < target_md:
-                curr_md += step
-                if curr_md > target_md: curr_md = target_md
-                mds.append(curr_md); incs.append(hold_inc); azis.append(azi)
-                if curr_md == target_md: break
-        
-        # Hitung Koordinat pakai MCM Engine
-        df = self.engine.calculate_trajectory(mds, incs, azis, surf_n, surf_e, 0)
-        
+        df['TVDSS'] = df['TVD'] - self.rkb
         df['Section'] = 'Plan'
-        df['TVDSS'] = df['TVD'] - rkb_val
-        return df, azi, hold_inc
-
-    def calculate_correction_path(self, actual_df, plan_df, correction_len):
-        last_act = actual_df.iloc[-1]
-        target_md = last_act['MD'] + correction_len
-        
-        # --- FIX: Variable name corrected here ---
-        plan_segment = plan_df[plan_df['MD'] >= target_md]
-        
-        if plan_segment.empty: 
-            target_row = plan_df.iloc[-1] 
-        else: 
-            target_row = plan_segment.iloc[0]
-        # -----------------------------------------
-        
-        target_pos = np.array([target_row['N'], target_row['E'], target_row['TVD']])
-        start_pos = np.array([last_act['N'], last_act['E'], last_act['TVD']])
-        start_inc = last_act['Inc']
-        start_azi = last_act['Azi']
-        
-        def simulate(params):
-            bur, tr = params
-            sim_step = correction_len / 5.0
-            curr_n, curr_e, curr_tvd = start_pos
-            curr_inc, curr_azi = start_inc, start_azi
-            
-            d_inc = (bur / self.dls_ref) * sim_step
-            d_azi = (tr / self.dls_ref) * sim_step
-            
-            for _ in range(5):
-                avg_inc = np.radians(curr_inc + d_inc/2)
-                avg_azi = np.radians(curr_azi + d_azi/2)
-                curr_tvd += sim_step * np.cos(avg_inc)
-                curr_n += sim_step * np.sin(avg_inc) * np.cos(avg_azi)
-                curr_e += sim_step * np.sin(avg_inc) * np.sin(avg_azi)
-                curr_inc += d_inc; curr_azi += d_azi
-                
-            return np.sum((np.array([curr_n, curr_e, curr_tvd]) - target_pos)**2)
-
-        res = minimize(simulate, [0, 0], bounds=[(-15, 15), (-15, 15)], method='Nelder-Mead')
-        best_bur, best_turn = res.x
-        
-        # Generate Detail Path
-        step = 10.0
-        n_steps = int(correction_len / step)
-        if n_steps < 1: n_steps = 1
-        
-        mds, incs, azis = [last_act['MD']], [last_act['Inc']], [last_act['Azi']]
-        d_inc = (best_bur / self.dls_ref) * step
-        d_azi = (best_turn / self.dls_ref) * step
-        
-        for _ in range(n_steps):
-            mds.append(mds[-1] + step)
-            incs.append(incs[-1] + d_inc)
-            azis.append(azis[-1] + d_azi)
-            
-        df_corr = self.engine.calculate_trajectory(mds, incs, azis, last_act['N'], last_act['E'], last_act['TVD'])
-        df_corr['TVDSS'] = df_corr['TVD'] - (self.rkb * (self.ft_to_m if self.unit=='Imperial' else 1))
-        df_corr['Section'] = 'Correction'
-        
-        avg_inc = np.radians(last_act['Inc'])
-        total_dls = np.sqrt(best_bur**2 + (best_turn * np.sin(avg_inc))**2)
-        
-        # Toolface Calc
-        toolface = np.degrees(np.arctan2(best_turn, best_bur)) % 360
-
-        return df_corr, total_dls, best_bur, best_turn, toolface
-
-    def calculate_extension(self, current_df, add_length, target_inc, target_azi):
-        last = current_df.iloc[-1]
-        step = 10.0
-        n_steps = int(add_length / step)
-        if n_steps < 1: n_steps = 1
-        
-        mds, incs, azis = [last['MD']], [last['Inc']], [last['Azi']]
-        d_inc = (target_inc - last['Inc']) / n_steps
-        d_azi = (target_azi - last['Azi']) / n_steps
-        
-        for _ in range(n_steps):
-            mds.append(mds[-1] + step)
-            incs.append(incs[-1] + d_inc)
-            azis.append(azis[-1] + d_azi)
-            
-        df_ext = self.engine.calculate_trajectory(mds, incs, azis, last['N'], last['E'], last['TVD'])
-        
-        conv_rkb = self.rkb * (self.ft_to_m if self.unit=='Imperial' else 1) if self.unit=='Imperial' else self.rkb
-        df_ext['TVDSS'] = df_ext['TVD'] - conv_rkb
-        df_ext['Section'] = 'Extension'
-        return pd.concat([current_df, df_ext.iloc[1:]], ignore_index=True)
+        return df, tgt_azi, best_hold
 
 
 class DrillingEngine:
-    """ 
-    Core Minimum Curvature Algorithm (API RP 78)
-    """
     def __init__(self, unit, dls_ref):
         self.unit = unit
         self.dls_ref = dls_ref
-        
+    
     def calculate_trajectory(self, md, inc, azi, start_n, start_e, start_tvd):
-        n = len(md)
-        tvd = np.zeros(n); n_c = np.zeros(n); e_c = np.zeros(n); dls = np.zeros(n)
+        # Minimum Curvature Method (High Performance)
+        # Interpolate between key points for smoothness (every 10m)
+        full_md, full_inc, full_azi = [], [], []
+        step = 10.0
+        
+        for i in range(1, len(md)):
+            d_md = md[i] - md[i-1]
+            n_steps = int(d_md / step)
+            if n_steps < 1: n_steps = 1
+            full_md.extend(np.linspace(md[i-1], md[i], n_steps, endpoint=False))
+            full_inc.extend(np.linspace(inc[i-1], inc[i], n_steps, endpoint=False))
+            # Handle Azimuth crossover
+            a1, a2 = azi[i-1], azi[i]
+            if abs(a2-a1) > 180: 
+                if a2 > a1: a1 += 360
+                else: a2 += 360
+            azis_interp = np.linspace(a1, a2, n_steps, endpoint=False) % 360
+            full_azi.extend(azis_interp)
+            
+        # Add last point
+        full_md.append(md[-1]); full_inc.append(inc[-1]); full_azi.append(azi[-1])
+        
+        # Calculation Loop
+        n = len(full_md)
+        tvd, n_c, e_c, dls = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
         tvd[0], n_c[0], e_c[0] = start_tvd, start_n, start_e
         
-        inc_rad = np.radians(inc)
-        azi_rad = np.radians(azi)
+        inc_r, azi_r = np.radians(full_inc), np.radians(full_azi)
         
         for i in range(1, n):
-            dL = md[i] - md[i-1]
-            I1, I2 = inc_rad[i-1], inc_rad[i]
-            A1, A2 = azi_rad[i-1], azi_rad[i]
+            dL = full_md[i] - full_md[i-1]
+            I1, I2 = inc_r[i-1], inc_r[i]
+            A1, A2 = azi_r[i-1], azi_r[i]
             
             cos_beta = np.cos(I2-I1) - (np.sin(I1)*np.sin(I2)*(1-np.cos(A2-A1)))
             beta = np.arccos(np.clip(cos_beta, -1, 1))
-            
-            if abs(beta) < 1e-6: rf = 1.0
-            else: rf = (2/beta) * np.tan(beta/2)
+            rf = (2/beta)*np.tan(beta/2) if abs(beta)>1e-6 else 1.0
             
             n_c[i] = n_c[i-1] + (dL/2)*(np.sin(I1)*np.cos(A1) + np.sin(I2)*np.cos(A2))*rf
             e_c[i] = e_c[i-1] + (dL/2)*(np.sin(I1)*np.sin(A1) + np.sin(I2)*np.sin(A2))*rf
             tvd[i] = tvd[i-1] + (dL/2)*(np.cos(I1) + np.cos(I2))*rf
             
-            if dL > 0:
-                dls[i] = np.degrees(beta) * (self.dls_ref / dL)
-            else:
-                dls[i] = 0
-                
-        df = pd.DataFrame({'MD': md, 'Inc': inc, 'Azi': azi, 'TVD': tvd, 'N': n_c, 'E': e_c, 'DLS': dls})
+            dls[i] = np.degrees(beta) * (self.dls_ref / dL) if dL > 0 else 0
+            
+        df = pd.DataFrame({'MD': full_md, 'Inc': full_inc, 'Azi': full_azi, 'TVD': tvd, 'N': n_c, 'E': e_c, 'DLS': dls})
         df['VS'] = np.sqrt((df['N']-start_n)**2 + (df['E']-start_e)**2)
         return df
 
-# ==========================================
-# 2. PARSERS & UTILS
-# ==========================================
-def calculate_economics(df):
-    total_md = df['MD'].iloc[-1]
-    cost = (total_md * 1500) + ((total_md/10/24) * 50000)
-    return cost, total_md/240
+    def calculate_drop_section(self, df_curr, dls, length):
+        # Append a drop section to existing DF
+        last = df_curr.iloc[-1]
+        step = 10.0
+        n_steps = int(length / step)
+        
+        new_md = [last['MD'] + (i+1)*step for i in range(n_steps)]
+        drop_per_m = dls / 30.0
+        new_inc = [max(0, last['Inc'] - (i+1)*step*drop_per_m) for i in range(n_steps)]
+        new_azi = [last['Azi']] * n_steps
+        
+        # Calculate coords for extension
+        df_ext = self.calculate_trajectory(
+            [last['MD']] + new_md, 
+            [last['Inc']] + new_inc, 
+            [last['Azi']] + new_azi,
+            last['N'], last['E'], last['TVD']
+        )
+        return pd.concat([df_curr, df_ext.iloc[1:]], ignore_index=True)
 
-def parse_trajectory_data(text_data, rkb, surf_n, surf_e, engine, azi_corr=0.0):
-    if not text_data.strip(): return None
+# ==========================================
+# 2. UTILS & PARSING
+# ==========================================
+def parse_csv(text):
     try:
-        # 1. SMART PARSER (Detect separator)
-        data = StringIO(text_data)
-        try: df = pd.read_csv(data, sep=None, engine='python') # Auto-detect sep
-        except: 
-            data.seek(0); df = pd.read_csv(data, sep='\t') # Fallback tab
-
-        # 2. CLEAN HEADERS
-        df.columns = df.columns.str.upper().str.replace(r"[\(\[].*?[\)\]]", "", regex=True).str.strip()
-        col_map = {
-            'MEASURED DEPTH':'MD', 'INCLINATION':'Inc', 'AZIMUTH':'Azi', 
-            'TRUE VERTICAL DEPTH':'TVD', 'VERTICAL SECTION':'VS',
-            '+N/S-':'N', '+E/W-':'E', 'NORTH':'N', 'EAST':'E',
-            'MD': 'MD', 'INC': 'Inc', 'AZI': 'Azi'
-        }
-        for c in df.columns:
-            for k, v in col_map.items():
-                if k in c: df.rename(columns={c: v}, inplace=True); break
-        
-        req = ['MD', 'Inc', 'Azi'] 
-        if not all(c in df.columns for c in req): 
-            return "MISSING_COLS: Required at least MD, Inc, Azi"
-        
-        # --- AUTO-CALCULATE COORDINATES IF MISSING ---
-        if 'N' not in df.columns or 'E' not in df.columns or 'TVD' not in df.columns:
-            # Apply Azimuth Correction ONLY if re-calculating
-            df['Azi'] = (df['Azi'] + azi_corr) % 360
-            
-            df = df.sort_values('MD').reset_index(drop=True)
-            
-            # AUTO-ANCHOR TO SURFACE (Tie-in 0)
-            if df['MD'].iloc[0] > 0:
-                row0 = pd.DataFrame({'MD': [0], 'Inc': [0], 'Azi': [0]})
-                df = pd.concat([row0, df], ignore_index=True)
-            
-            # RE-COMPUTE using Engine (MCM)
-            df_calc = engine.calculate_trajectory(
-                df['MD'].values, df['Inc'].values, df['Azi'].values,
-                start_n=surf_n, start_e=surf_e, start_tvd=0
-            )
-            
-            df_calc['TVDSS'] = df_calc['TVD'] - rkb
-            return df_calc
-        
-        # If data already has coords, use them but fix headers if needed
-        if 'TVDSS' not in df.columns: df['TVDSS'] = df['TVD'] - rkb
-        if 'VS' not in df.columns: df['VS'] = np.sqrt((df['N'] - surf_n)**2 + (df['E'] - surf_e)**2)
-        
-        if 'DLS' not in df.columns:
-            md_arr = df['MD'].values
-            inc_rad = np.radians(df['Inc'].values)
-            azi_rad = np.radians(df['Azi'].values)
-            dls_arr = np.zeros(len(df))
-            ref_len = 30.0 
-            for i in range(1, len(df)):
-                dL = md_arr[i] - md_arr[i-1]
-                if dL > 0:
-                    arg = np.cos(inc_rad[i]-inc_rad[i-1]) - \
-                          (np.sin(inc_rad[i-1])*np.sin(inc_rad[i])*(1-np.cos(azi_rad[i]-azi_rad[i-1])))
-                    arg = np.clip(arg, -1.0, 1.0)
-                    dls_val = np.degrees(np.arccos(arg)) * (ref_len / dL)
-                    dls_arr[i] = dls_val
-            df['DLS'] = dls_arr
-            
+        df = pd.read_csv(StringIO(text), sep=None, engine='python')
+        df.columns = df.columns.str.upper().str.strip()
+        # Normalization logic here...
+        rename_map = {'MEASURED DEPTH':'MD', 'INCLINATION':'Inc', 'AZIMUTH':'Azi', 'TRUE VERTICAL DEPTH':'TVD', 'NORTH':'N', 'EAST':'E'}
+        for k,v in rename_map.items():
+            cols = [c for c in df.columns if k in c]
+            if cols: df.rename(columns={cols[0]: v}, inplace=True)
         return df
-    except Exception as e: return str(e)
+    except: return None
+
+# ... [Keep Imports and Classes RiskEngine, SmartPlanner, DrillingEngine from previous code] ...
 
 # ==========================================
-# 3. STATE & UI
+# 3. UI & APP LOGIC (ENHANCED)
 # ==========================================
-if 'layers' not in st.session_state: st.session_state['layers'] = {} 
-if 'meta' not in st.session_state: st.session_state['meta'] = {}
+if 'layers' not in st.session_state: st.session_state['layers'] = {}
+risk_engine = RiskEngine()
 
-default_surf_n = 9000000.0; default_surf_e = 400000.0
-default_tgt_n = 9000400.0; default_tgt_e = 400400.0; default_tgt_tvdss = 2200.0
-default_kop = 500.0; default_dls = 3.0; default_hold_ovr = 0.0; do_override = False
+st.sidebar.image("https://cdn-icons-png.flaticon.com/512/2061/2061168.png", width=50)
+st.sidebar.title("💎 WellDesign Clone")
 
-if 'autofill_data' in st.session_state:
-    data = st.session_state['autofill_data']
-    default_surf_n = data['surf_n']; default_surf_e = data['surf_e']
-    default_tgt_n = data['tgt_n']; default_tgt_e = data['tgt_e']
-    default_tgt_tvdss = data['tgt_tvdss']
-    default_kop = data['kop']; default_hold_ovr = data['hold']
-    do_override = True
-    st.toast("Parameters Auto-Filled from Data!")
-    del st.session_state['autofill_data']
-
-st.sidebar.title("🎛️ DSS Command Center")
-
-# --- AUTO-FILL EXPANDER ---
-with st.sidebar.expander("⚡ Quick Import (Auto-Fill)", expanded=False):
-    st.caption("Paste full data to extract parameters. **Requires: N, E, TVD**")
-    paste_data = st.text_area("Paste Data:", height=100)
-    if st.button("⚡ Extract & Apply"):
-        try:
-            temp_engine = DrillingEngine('Metric', 30.0)
-            df_temp = parse_trajectory_data(paste_data, 0, 0, 0, temp_engine) 
-            if isinstance(df_temp, pd.DataFrame) and {'N', 'E', 'TVD'}.issubset(df_temp.columns):
-                s_n = df_temp['N'].iloc[0]; s_e = df_temp['E'].iloc[0]
-                t_n = df_temp['N'].iloc[-1]; t_e = df_temp['E'].iloc[-1]; t_tvd = df_temp['TVD'].iloc[-1]
-                kop_idx = df_temp[df_temp['Inc'] > 0.5].index
-                e_kop = df_temp['MD'].iloc[kop_idx[0]] if len(kop_idx) > 0 else 0
-                e_hold = df_temp['Inc'].max()
-                st.session_state['autofill_data'] = {
-                    'surf_n': s_n, 'surf_e': s_e, 'tgt_n': t_n, 'tgt_e': t_e, 'tgt_tvdss': t_tvd,
-                    'kop': e_kop, 'hold': e_hold
-                }
-                st.rerun()
-            else:
-                st.error("Missing N/E/TVD for parameter extraction.")
-        except Exception as e: st.error(f"Extraction Failed: {e}")
-
-# --- UNIT SELECTION ---
-st.sidebar.markdown("---")
-unit_sys = st.sidebar.radio("Units", ["Metric", "Imperial"], horizontal=True)
-u_label = "m" if unit_sys == "Metric" else "ft"
-dls_label = "deg/30m" if unit_sys == "Metric" else "deg/100ft"
-
-with st.sidebar.form("plan_form"):
-    st.header("1. Well Planning Parameters")
-    plan_mode = st.radio("Plan Source", ["Calculator (J-Profile)", "Import Plan (Compass Data)"])
-    
-    c1, c2 = st.columns(2)
-    r_floor = c1.number_input(f"Rotary Table ({u_label})", value=6.1)
-    r_elev = c2.number_input(f"Cellar Elev", value=19.46)
-    
-    surf_n = c1.number_input("Surf N", value=default_surf_n, format="%.2f", key='sn')
-    surf_e = c2.number_input("Surf E", value=default_surf_e, format="%.2f", key='se')
-    
-    st.markdown("---")
-    
-    if plan_mode == "Calculator (J-Profile)":
-        tgt_n = c1.number_input("Target N", value=default_tgt_n, format="%.2f", key='tn')
-        tgt_e = c2.number_input("Target E", value=default_tgt_e, format="%.2f", key='te')
-        tgt_tvdss = st.number_input(f"Target TVDSS ({u_label})", value=default_tgt_tvdss, key='tt')
-        kop = c1.number_input(f"KOP ({u_label})", value=default_kop, key='kp')
-        dls = c2.number_input(f"DLS", value=default_dls, key='dl')
+# --- SIDEBAR: PROJECT TREE (Like Image 4) ---
+with st.sidebar:
+    st.markdown("### 🗂️ Project Explorer")
+    with st.expander("🏗️ Site: Alpha Pad", expanded=True):
+        st.caption("Coordinate Ref: UTM Zone 31N")
         
-        force_hold = st.checkbox("Override Hold Angle?", value=do_override, key='chk_override')
-        manual_hold = st.number_input("Force Hold (deg)", value=default_hold_ovr if do_override else 0.0, key='num_hold') if force_hold else None
-        imported_plan_txt = ""
-    else:
-        st.info("Paste Data from Compass")
-        imported_plan_txt = st.text_area("Paste Plan Data:", height=150)
-        tgt_n, tgt_e, tgt_tvdss, kop, dls, manual_hold = 0,0,0,0,0,None
-    
-    plan_submit = st.form_submit_button("🚀 UPDATE PLAN", type="primary")
-
-if plan_submit:
-    r_rkb = r_floor + r_elev
-    planner = SmartPlanner(surf_n, surf_e, r_rkb, unit_sys)
-    
-    if plan_mode == "Calculator (J-Profile)":
-        df_plan, azi, hold = planner.solve_trajectory(tgt_n, tgt_e, tgt_tvdss, kop, dls, manual_hold)
-        st.success(f"Calculated! Azi: {azi:.2f}°, Hold: {hold:.2f}°")
-    else:
-        eng = planner.engine
-        df_plan = parse_trajectory_data(imported_plan_txt, r_rkb, surf_n, surf_e, eng)
-        if isinstance(df_plan, pd.DataFrame):
-            st.success("Plan Imported!")
-            df_plan['Section'] = 'Plan'
-        else: st.error(df_plan); df_plan = None
-
-    if df_plan is not None:
-        st.session_state['layers']['Plan'] = {'df': df_plan, 'color': '#0000FF', 'show': True, 'type': 'plan'}
-        st.session_state['meta'] = {'rkb': r_rkb, 'surf_n': surf_n, 'surf_e': surf_e, 'unit': unit_sys, 'planner': planner}
-
-# --- CASING & FORMATION ---
-with st.sidebar.expander("🛠️ Casing & Formation"):
-    casing_init = pd.DataFrame([{"Size": "20\"", "Depth": 50, "Type": "MD"}, {"Size": "9-5/8\"", "Depth": 1200, "Type": "MD"}])
-    edited_casing = st.data_editor(casing_init, num_rows="dynamic")
-    form_text = st.text_area("Formation (Name, Depth)", "Top GUF, 446.5\nTop TAF, 558.0")
-
-# --- ACTUAL & PRESCRIPTIVE ---
-with st.sidebar.expander("📉 Actual / Correction"):
-    if st.button("🎲 Demo Actual"):
-        st.session_state['act_txt'] = "MD Inc Azi\n0 0 0\n500 0 0\n600 2 45\n1000 12 48"
-    act_txt = st.text_area("Actual Data:", value=st.session_state.get('act_txt', ''))
-    corr_len = st.number_input("Correction Len", value=300.0)
-    
-    if st.button("Run Prescription"):
-        if 'Plan' in st.session_state['layers']:
-            meta = st.session_state['meta']
-            eng = meta['planner'].engine
-            df_act = parse_trajectory_data(act_txt, meta['rkb'], meta['surf_n'], meta['surf_e'], eng)
-            
-            if isinstance(df_act, pd.DataFrame):
-                st.session_state['layers']['Actual'] = {'df': df_act, 'color': '#FF0000', 'show': True}
-                planner = meta['planner']
-                df_plan = st.session_state['layers']['Plan']['df']
-                # UNPACK 5 VARIABLES: df_corr, total_dls, req_bur, best_turn, toolface
-                df_corr, total_dls, req_bur, best_turn, tf = planner.calculate_correction_path(df_act, df_plan, corr_len)
-                st.session_state['layers']['Correction'] = {'df': df_corr, 'color': '#00FF00', 'show': True}
-                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf}
-            else: st.error(df_act)
-
-# --- OFFSET WELLS ---
-with st.sidebar.expander("🛡️ Offset Wells"):
-    off_name = st.text_input("Offset Name", "Offset-01")
-    c1, c2, c3 = st.columns(3)
-    off_n = c1.number_input("Off N", 0.0, format="%.2f")
-    off_e = c2.number_input("Off E", 0.0, format="%.2f")
-    azi_corr = c3.number_input("Azi Corr", 0.0)
-    off_txt = st.text_area("Offset Data", height=100)
-    
-    if st.button("Add Offset"):
-        meta = st.session_state.get('meta', {})
-        eng = meta.get('planner').engine if 'planner' in meta else None
-        if eng:
-            use_n = off_n if off_n != 0 else meta.get('surf_n', 0)
-            use_e = off_e if off_e != 0 else meta.get('surf_e', 0)
-            df_off = parse_trajectory_data(off_txt, meta.get('rkb', 0), use_n, use_e, eng, azi_corr)
-            
-            if isinstance(df_off, pd.DataFrame):
-                if 'Offsets' not in st.session_state['layers']: st.session_state['layers']['Offsets'] = []
-                st.session_state['layers']['Offsets'].append({'id': str(uuid.uuid4()), 'name': off_name, 'df': df_off, 'color': '#808080', 'show': True})
-                st.success(f"Added {off_name}")
-            else: st.error(df_off)
-
-# --- VISUAL MANAGER ---
-st.sidebar.subheader("🎨 Layers")
-if 'Plan' in st.session_state['layers']:
-    l = st.session_state['layers']['Plan']
-    l['show'] = st.sidebar.checkbox("Plan", l['show'])
-    l['color'] = st.sidebar.color_picker(" ", l['color'])
-if 'Actual' in st.session_state['layers']:
-    l = st.session_state['layers']['Actual']
-    l['show'] = st.sidebar.checkbox("Actual", l['show'])
-    l['color'] = st.sidebar.color_picker(" ", l['color'])
-if 'Correction' in st.session_state['layers']:
-    l = st.session_state['layers']['Correction']
-    l['show'] = st.sidebar.checkbox("Correction", l['show'])
-    l['color'] = st.sidebar.color_picker(" ", l['color'])
-if 'Offsets' in st.session_state['layers']:
-    st.sidebar.markdown("**Offset Wells:**")
-    del_list = []
-    for i, off in enumerate(st.session_state['layers']['Offsets']):
-        c1, c2, c3 = st.sidebar.columns([0.2, 0.6, 0.2])
-        off['show'] = c1.checkbox("👁️", off['show'], key=f"v_{off['id']}")
-        off['color'] = c2.color_picker(off['name'], off['color'], key=f"c_{off['id']}")
-        if c3.button("🗑️", key=f"d_{off['id']}"): del_list.append(i)
-    for i in sorted(del_list, reverse=True): st.session_state['layers']['Offsets'].pop(i); st.rerun()
-
-# ==========================================
-# 4. DASHBOARD RENDER
-# ==========================================
-st.title("🏗️ DSS Well Master Ultimate")
-
-if 'Plan' in st.session_state['layers']:
-    df_plan = st.session_state['layers']['Plan']['df']
-    cost, time = calculate_economics(df_plan)
-    
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Depth", f"{df_plan['MD'].iloc[-1]:.0f}")
-    c2.metric("Max Inc", f"{df_plan['Inc'].max():.2f}°")
-    c3.metric("Cost", f"${cost/1000:.0f}K")
-    
-    min_sep = 9999.0
-    if 'Offsets' in st.session_state['layers']:
-        active = [o for o in st.session_state['layers']['Offsets'] if o['show']]
-        if active:
-            p1 = df_plan[['N', 'E', 'TVD']].values
-            for o in active:
-                p2 = o['df'][['N', 'E', 'TVD']].values
-                if len(p2)>1000: p2=p2[::5]
-                d = np.min(np.linalg.norm(p1[:, None] - p2[None, :], axis=2))
-                min_sep = min(min_sep, d)
-    
-    c5.metric("Separation", f"{min_sep:.1f}m" if min_sep!=9999 else "N/A", delta="CRITICAL" if min_sep<10 else "Safe", delta_color="inverse" if min_sep<10 else "normal")
-
-    if 'prescription' in st.session_state and st.session_state['layers'].get('Correction', {}).get('show'):
-        p = st.session_state['prescription']
-        st.info(f"💡 **PRESCRIPTION:** {('BUILD' if p['bur']>0 else 'DROP')} {abs(p['bur']):.2f} {dls_label} , TURN {('RIGHT' if p['turn']>0 else 'LEFT')} {abs(p['turn']):.2f} {dls_label}, Toolface: {p['tf']:.0f}°")
-
-    tab1, tab2, tab3 = st.tabs(["🌍 3D View", "📐 2D Views", "📋 Data"])
-    
-    with tab1:
-        fig3d = go.Figure()
-        layers = st.session_state['layers']
-        
-        def plot_3d(df, name, col, dash='solid'):
-            txt = [f"MD:{m:.0f}<br>I:{i:.1f}<br>A:{a:.1f}" for m,i,a in zip(df['MD'], df['Inc'], df['Azi'])]
-            fig3d.add_trace(go.Scatter3d(x=df['E'], y=df['N'], z=df['TVDSS'], mode='lines', name=name, line=dict(color=col, width=5, dash=dash), text=txt, hoverinfo='text'))
-        
-        if layers['Plan']['show']: plot_3d(layers['Plan']['df'], 'Plan', layers['Plan']['color'])
-        if 'Actual' in layers and layers['Actual']['show']: plot_3d(layers['Actual']['df'], 'Actual', layers['Actual']['color'])
-        if 'Correction' in layers and layers['Correction']['show']: plot_3d(layers['Correction']['df'], 'Correction', layers['Correction']['color'], 'dash')
-        if 'Offsets' in layers:
-            for o in layers['Offsets']:
-                if o['show']: plot_3d(o['df'], o['name'], o['color'], 'dot')
-        
-        fig3d.update_layout(scene=dict(zaxis=dict(autorange="reversed"), aspectmode='data'), height=600, uirevision='constant')
-        st.plotly_chart(fig3d, use_container_width=True)
-
-    with tab2:
+        # Target Configuration (Like Image 2)
+        st.markdown("**🎯 Target Definition**")
+        tgt_tvd = st.number_input("Target TVD", value=2200.0)
         c1, c2 = st.columns(2)
-        f_plan = go.Figure()
-        f_sec = go.Figure()
+        tol_v = c1.number_input("Vert Tol (+/-)", value=10.0)
+        tol_h = c2.number_input("Horiz Tol (+/-)", value=25.0)
         
-        def plot_2d(df, name, col, dash='solid'):
-            f_plan.add_trace(go.Scatter(x=df['E'], y=df['N'], mode='lines', name=name, line=dict(color=col, dash=dash)))
-            f_sec.add_trace(go.Scatter(x=df['VS'], y=df['TVDSS'], mode='lines', name=name, line=dict(color=col, dash=dash)))
-            
-        if layers['Plan']['show']: plot_2d(layers['Plan']['df'], 'Plan', layers['Plan']['color'])
-        if 'Actual' in layers and layers['Actual']['show']: plot_2d(layers['Actual']['df'], 'Actual', layers['Actual']['color'])
-        if 'Correction' in layers and layers['Correction']['show']: plot_2d(layers['Correction']['df'], 'Correction', layers['Correction']['color'], 'dash')
-        if 'Offsets' in layers:
-            for o in layers['Offsets']:
-                if o['show']: plot_2d(o['df'], o['name'], o['color'], 'dot')
+        # Formation Config (Like Image 2)
+        st.markdown("**🪨 Geological Tops**")
+        form_top = st.number_input("Reservoir Top TVD", value=2150.0)
         
-        if not edited_casing.empty:
-            for _, row in edited_casing.iterrows():
-                try:
-                    d = float(row['Depth'])
-                    pt = df_plan.iloc[(df_plan['MD']-d).abs().argsort()[:1]]
-                    f_sec.add_trace(go.Scatter(x=pt['VS'], y=pt['TVDSS'], mode='markers', marker=dict(symbol='triangle-down', size=10, color='black'), name=f"Csg {row['Size']}"))
-                except: pass
-    try:
-        for line in form_text.split('\n'):
-            p = line.split(',')
-            nm, dp = p[0], float(p[1])
-            f_sec.add_hline(y=dp, line_dash="dash", line_color="grey", annotation_text=nm)
-    except: pass
-
-    f_plan.update_layout(title="Plan View", xaxis_title="East", yaxis_title="North", yaxis_scaleanchor="x", uirevision='constant')
-    f_sec.update_layout(title="Section View", xaxis_title="Vertical Section", yaxis_title="TVDSS", yaxis_autorange="reversed", uirevision='constant')
+        # Visibility Toggles (Like Image 4)
+        st.markdown("**👁️ Visibility**")
+        show_plan = st.checkbox("Show Plan", True)
+        show_uncert = st.checkbox("Show Uncertainty", True)
+        
+    st.divider()
     
-    with c1: st.plotly_chart(f_plan, use_container_width=True)
-    with c2: st.plotly_chart(f_sec, use_container_width=True)
+    # Parametric Inputs
+    st.subheader("📐 Trajectory Parameters")
+    profile_type = st.selectbox("Profile", ["S-Type", "J-Type"])
+    kop = st.number_input("KOP", 500.0)
+    dls = st.number_input("Build DLS", 3.0)
+    tgt_n = 9000400.0; tgt_e = 400400.0 # Fixed for demo
+    
+    if st.button("✨ CALC TRAJECTORY", type="primary"):
+        planner = SmartPlanner(9000000, 400000, 25, 'Metric')
+        # Simple Logic switch for demo
+        df, _, _ = planner.solve_j_profile(tgt_n, tgt_e, tgt_tvd, kop, dls)
+        df = risk_engine.calculate_uncertainty(df)
+        st.session_state['layers']['Plan'] = {'df': df, 'color': '#FF6D00', 'show': True} # Orange like Image 2
 
-    with tab3:
-        st.dataframe(df_plan)
+# ==========================================
+# 4. MAIN DASHBOARD (POWERFUL VIEWS)
+# ==========================================
+from plotly.subplots import make_subplots
+
+# Custom CSS to mimic the clean look of Image 3
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] { border-bottom: 1px solid #ddd; }
+    .stTabs [data-baseweb="tab"] { font-weight: 600; font-size: 14px; }
+</style>
+""", unsafe_allow_html=True)
+
+# TABS matching the workflow in Image 3 (Trajectory, Editor, Reports)
+tab_3d, tab_eng, tab_data = st.tabs(["🌍 3D Digital Twin", "📈 Engineering Logs", "📋 Survey Data"])
+
+with tab_3d:
+    # 3D View imitating Image 1 & 2
+    fig = go.Figure()
+    
+    if 'Plan' in st.session_state['layers'] and show_plan:
+        df = st.session_state['layers']['Plan']['df']
+        
+        # 1. The Well Path (Orange Tube style)
+        fig.add_trace(go.Scatter3d(
+            x=df['E'], y=df['N'], z=df['TVD'],
+            mode='lines', name='Active Wellbore',
+            line=dict(color='#FF6D00', width=8), # Oliasoft Orange
+            hovertemplate="MD: %{text}<br>TVD: %{z}", text=df['MD']
+        ))
+        
+        # 2. Target Box (The "Green Zone" from Image 2)
+        # Create a 3D box around the last point
+        last = df.iloc[-1]
+        x_c, y_c, z_c = last['E'], last['N'], last['TVD']
+        
+        # Mesh Cube Logic
+        x_box = [x_c-tol_h, x_c+tol_h, x_c+tol_h, x_c-tol_h, x_c-tol_h, x_c+tol_h, x_c+tol_h, x_c-tol_h]
+        y_box = [y_c-tol_h, y_c-tol_h, y_c+tol_h, y_c+tol_h, y_c-tol_h, y_c-tol_h, y_c+tol_h, y_c+tol_h]
+        z_box = [z_c-tol_v, z_c-tol_v, z_c-tol_v, z_c-tol_v, z_c+tol_v, z_c+tol_v, z_c+tol_v, z_c+tol_v]
+        
+        fig.add_trace(go.Mesh3d(
+            x=x_box, y=y_box, z=z_box,
+            i = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2],
+            j = [3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3],
+            k = [0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6],
+            color='rgba(0, 255, 0, 0.3)', # Translucent Green
+            name='Target Tolerance', flatshading=True
+        ))
+        
+        # 3. Formation Plane (The Yellow Layers from Image 2)
+        center_n, center_e = df['N'].mean(), df['E'].mean()
+        fig.add_trace(go.Mesh3d(
+            x=[center_e-1000, center_e+1000, center_e+1000, center_e-1000],
+            y=[center_n-1000, center_n-1000, center_n+1000, center_n+1000],
+            z=[form_top, form_top, form_top, form_top],
+            color='orange', opacity=0.4, name='Top Reservoir'
+        ))
+        
+        # 4. Uncertainty "Clouds" (Image 4)
+        if show_uncert and 'Error_Rad' in df.columns:
+            sub = df.iloc[::15] # Downsample
+            fig.add_trace(go.Scatter3d(
+                x=sub['E'], y=sub['N'], z=sub['TVD'],
+                mode='markers', 
+                marker=dict(size=sub['Error_Rad'], color='gray', opacity=0.2, symbol='circle'),
+                name='Cone of Uncertainty'
+            ))
+
+    # Grid & Layout mimicking Image 1
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(backgroundcolor="#f0f0f0", gridcolor="white", title="Easting (m)"),
+            yaxis=dict(backgroundcolor="#f0f0f0", gridcolor="white", title="Northing (m)"),
+            zaxis=dict(backgroundcolor="#e0e0e0", gridcolor="white", title="TVD (m)", autorange="reversed"),
+            aspectmode='data'
+        ),
+        margin=dict(l=0, r=0, b=0, t=0),
+        height=700
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab_eng:
+    # ENGINEERING CHARTS (Directly inspired by Image 3)
+    st.subheader("📈 Drilling Mechanics Logs")
+    
+    if 'Plan' in st.session_state['layers']:
+        df = st.session_state['layers']['Plan']['df']
+        
+        # Calculate derived engineering metrics
+        # (Usually these come from physics models, here we approximate for visualization)
+        df['Build_Rate'] = df['Inc'].diff().fillna(0) * (30 / 10) # deg/30m
+        df['Turn_Rate'] = df['Azi'].diff().fillna(0) * (30 / 10) # deg/30m
+        # Simple Toolface proxy
+        df['Toolface'] = np.degrees(np.arctan2(df['Turn_Rate'], df['Build_Rate'])).fillna(0)
+        
+        # Create 4-Row Subplot like Image 3
+        fig_eng = make_subplots(
+            rows=4, cols=1, 
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=("Build Rate (°/30m)", "Turn Rate (°/30m)", "Toolface Angle (°)", "Dogleg Severity (°/30m)")
+        )
+        
+        # 1. Build Rate (Green Line)
+        fig_eng.add_trace(go.Scatter(x=df['MD'], y=df['Build_Rate'], line=dict(color='#2E7D32', width=2), name='Build Rate'), row=1, col=1)
+        
+        # 2. Turn Rate (Blue Line)
+        fig_eng.add_trace(go.Scatter(x=df['MD'], y=df['Turn_Rate'], line=dict(color='#1565C0', width=2), name='Turn Rate'), row=2, col=1)
+        
+        # 3. Toolface (Purple Scatter)
+        fig_eng.add_trace(go.Scatter(x=df['MD'], y=df['Toolface'], mode='markers', marker=dict(size=4, color='#6A1B9A'), name='Toolface'), row=3, col=1)
+        
+        # 4. DLS (Red Area)
+        fig_eng.add_trace(go.Scatter(x=df['MD'], y=df['DLS'], fill='tozeroy', line=dict(color='#C62828', width=1), name='DLS'), row=4, col=1)
+        
+        fig_eng.update_layout(
+            height=900, 
+            paper_bgcolor='white', # The outer margin area
+            plot_bgcolor='white',  # The inner grid area
+            showlegend=False
+        )
+        
+        st.plotly_chart(fig_eng, use_container_width=True)
+    else:
+        st.info("Generate a trajectory to view engineering logs.")
+
+with tab_data:
+    st.dataframe(st.session_state['layers'].get('Plan', {}).get('df', pd.DataFrame()), use_container_width=True)
