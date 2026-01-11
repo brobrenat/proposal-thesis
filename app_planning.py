@@ -8,7 +8,12 @@ from io import StringIO
 import uuid
 import warnings
 import re
+import io
 import xml.etree.ElementTree as ET
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from pypdf import PdfReader, PdfWriter
+from datetime import datetime # Import datetime untuk Created On
 
 warnings.filterwarnings('ignore')
 
@@ -535,11 +540,7 @@ def parse_trajectory_data(input_data, rkb, surf_n, surf_e, engine, azi_corr=0.0)
 def parse_scenario_bha_chain(xml_file):
     """
     Parser Berjenjang dengan LOOKUP Logic & SORTING:
-    1. Scan CD_SCENARIO & CD_CASE.
-    2. Scan MB_ASSEMBLY_COMP (buat kamus Referensi Nama).
-    3. Scan CD_ASSEMBLY_COMP (simpan sementara + ambil sequence_no).
-    4. Gabungkan (Join) Nama.
-    5. SORTING berdasarkan Sequence Number.
+    UPDATE: Menambahkan kolom 'Weight (ppf)' dari attribute 'approximate_weight'.
     """
     try:
         xml_file.seek(0)
@@ -592,14 +593,12 @@ def parse_scenario_bha_chain(xml_file):
             # D. DATA KOMPONEN MENTAH (CD_)
             elif tag in ['CD_ASSEMBLY_COMP', 'CD_ASSEMBLY_COMPONENT', 'CD_DRILL_STRING_COMP']:
                 if attr.get('assembly_id'):
-                    # --- NEW: AMBIL SEQUENCE NO ---
-                    # Kita ubah ke integer agar urutannya benar (1, 2, 10 bukan 1, 10, 2)
+                    # AMBIL SEQUENCE NO
                     try:
                         seq = int(attr.get('sequence_no', 0))
                     except ValueError:
-                        seq = 0 # Default jika error/kosong
+                        seq = 0 
                     
-                    # Simpan sequence ke dalam dictionary raw
                     attr['parsed_seq'] = seq 
                     raw_cd_comps.append(attr)
 
@@ -616,12 +615,19 @@ def parse_scenario_bha_chain(xml_file):
 
             final_components.append({
                 'assembly_id': attr.get('assembly_id'),
-                'Sequence': attr['parsed_seq'],  # <--- Field Baru untuk Sorting
+                
+                # PERBAIKAN DI SINI:
+                # Ambil nilainya dulu (attr['parsed_seq']), baru ditambah 1 di luar kurung
+                'Sequence': attr['parsed_seq'] + 1, 
+                
                 'Description': display_name,
                 'Connection': attr.get('connection_name', attr.get('connection_type', '-')),
                 'OD (in)': float(attr.get('od_body', attr.get('body_od', attr.get('od', 0)))),
                 'ID (in)': float(attr.get('id_body', attr.get('body_id', attr.get('id', 0)))),
-                'Length': float(attr.get('element_length', attr.get('length', 0))) 
+                'Length': float(attr.get('element_length', attr.get('length', 0))),
+                
+                # --- NEW FIELD: APPROXIMATE WEIGHT ---
+                'Weight ': float(attr.get('approximate_weight', 0)) 
             })
 
         # Konversi ke DataFrame
@@ -629,14 +635,12 @@ def parse_scenario_bha_chain(xml_file):
         
         # 4. SORTING LOGIC
         if not df_comps.empty:
-            # Urutkan berdasarkan Assembly ID dulu, baru Sequence Number
             df_comps = df_comps.sort_values(by=['assembly_id', 'Sequence'], ascending=[True, True])
 
         return scenarios, pd.DataFrame(cases), df_comps
 
     except Exception as e:
         return {}, pd.DataFrame(), pd.DataFrame()
-
 def get_scenarios_dual_keys(xml_file):
     """
     Parser Dual Key:
@@ -693,6 +697,142 @@ def get_scenarios_dual_keys(xml_file):
 
     except Exception as e:
         return {}
+
+def generate_bha_pdf(template_path, header_data, df_bha):
+    """
+    Fixed Version: Header Tabel Muncul & Sequence Mulai dari 1
+    """
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=A4)
+    
+    # ==========================================
+    # 1. HEADER HALAMAN (Customer, Well, dll)
+    # ==========================================
+    c.setFont("Helvetica-Bold", 9)
+    
+    # Created On (Pojok Kanan Atas)
+    current_date = datetime.now().strftime("%d-%b-%Y")
+    c.setFillColorRGB(1, 1, 1) # Putih
+    c.drawString(523, 770, current_date)
+    c.setFillColorRGB(0, 0, 0) # Hitam
+    
+    # Well Info
+    x_val = 355 
+    c.drawString(x_val, 752, str(header_data.get('customer', '-')))
+    c.drawString(x_val, 737, str(header_data.get('well_name', '-')))
+    c.drawString(x_val, 722, str(header_data.get('job_number', '-')))
+    c.drawString(x_val, 707, str(header_data.get('rig_name', '-')))
+    c.drawString(x_val, 692, str(header_data.get('field_name', '-')))
+    c.drawString(x_val, 677, str(header_data.get('country', 'Indonesia')))
+
+    # ==========================================
+    # 2. HEADER TABEL (BAGIAN YANG HILANG KEMARIN)
+    # ==========================================
+    # Kita gambar ulang judul kolom agar pasti muncul
+    y_header = 615 
+    
+    # Definisi Garis Vertikal (Sama untuk Header & Data)
+    v_lines = [25, 50, 300, 350, 400, 450, 550] 
+    
+    # A. Gambar Garis Header
+    c.setStrokeColorRGB(0.5, 0.5, 0.5)
+    c.setLineWidth(0.5)
+    
+    # Garis Horizontal ATAS Header
+    c.line(25, y_header + 10, 550, y_header + 10)
+    
+    # Garis Horizontal BAWAH Header
+    c.line(25, y_header - 4, 550, y_header - 4)
+    
+    # Garis Vertikal Header
+    for vx in v_lines:
+        c.line(vx, y_header + 10, vx, y_header - 4)
+    
+    c.setFont("Helvetica-Bold", 8)
+    c.setFillColorRGB(0, 0, 0) # Hitam
+    
+    # Judul Kolom Manual (Sesuaikan posisi X dengan kolom grid)
+    # Gunakan drawCentredString agar rapi di tengah kolom
+    c.drawCentredString(37.5, y_header, "No")
+    c.drawString(55, y_header, "Description") # Rata kiri
+    c.drawCentredString(325, y_header, "OD (in)")
+    c.drawCentredString(375, y_header, "ID (in)")
+    c.drawCentredString(425, y_header, "Weight (ppf)")
+    c.drawCentredString(500, y_header, "Cum. Len")
+    
+    # Garis Pembatas Header (Bawah Judul)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(1)
+    c.line(25, y_header - 5, 550, y_header - 5)
+
+    # ==========================================
+    # 3. ISI DATA TABEL
+    # ==========================================
+    y_position = 600 
+    row_height = 15
+    
+    c.setFont("Helvetica", 8)
+    cum_len = 0
+    v_lines = [25, 50, 300, 350, 400, 450, 550] 
+    
+    # Reset index agar iterasi mulai dari 0 lagi untuk penomoran
+    for index, row in df_bha.reset_index(drop=True).iterrows():
+        if y_position < 50:
+            c.drawString(50, y_position, "... (Data berlanjut) ...")
+            break
+        
+        # --- PERBAIKAN SEQUENCE ---
+        # Paksa sequence menggunakan index loop + 1.
+        # Jadi baris pertama pasti "1", baris kedua "2", dst.
+        seq = str(index + 1)
+        
+        desc = str(row.get('Description', '-'))[:45]
+        od = f"{row.get('OD (in)', 0):.3f}"
+        id_pipe = f"{row.get('ID (in)', 0):.3f}"
+        length = row.get('Length', 0)
+        cum_len += length
+        
+        # Gambar Garis Grid
+        c.setStrokeColorRGB(0.5, 0.5, 0.5)
+        c.setLineWidth(0.5)
+        c.line(25, y_position - 4, 550, y_position - 4) # Garis Horizontal
+        
+        y_top = y_position + 10
+        y_bot = y_position - 4
+        for vx in v_lines:
+            c.line(vx, y_top, vx, y_bot) # Garis Vertikal
+            
+        # Isi Teks
+        c.setFillColorRGB(0, 0, 0) 
+        c.drawCentredString(37.5, y_position, seq)      # No Urut Baru (1, 2, 3...)
+        c.drawString(55, y_position, desc)
+        c.drawCentredString(325, y_position, od)
+        c.drawCentredString(375, y_position, id_pipe)
+        c.drawCentredString(425, y_position, f"{length:.2f}")
+        c.drawCentredString(500, y_position, f"{cum_len:.2f}")
+        
+        y_position -= row_height
+
+    c.save()
+    packet.seek(0)
+
+    # ==========================================
+    # 4. MERGE DENGAN TEMPLATE
+    # ==========================================
+    new_pdf = PdfReader(packet)
+    existing_pdf = PdfReader(template_path)
+    output = PdfWriter()
+
+    page = existing_pdf.pages[0]
+    page.merge_page(new_pdf.pages[0])
+    output.add_page(page)
+
+    out_stream = io.BytesIO()
+    output.write(out_stream)
+    out_stream.seek(0)
+    
+    return out_stream
+
 # ==========================================
 # 3. STATE & UI
 # ==========================================
@@ -1354,141 +1494,186 @@ if 'Plan' in st.session_state['layers']:
         else:
             st.info("Generate a trajectory to view engineering logs.")
 
-        with tab5:
-                st.header("🔧 BHA & Assembly Viewer")
-                st.caption("Auto-link dengan file dari Quick Import.")
+    with tab5:
+        st.header("🔧 BHA & Assembly Viewer")
+        st.caption("Auto-link dengan file dari Quick Import.")
+        
+        col_bha_1, col_bha_2 = st.columns([1, 2])
+        
+        selected_comps_df = None
+        sel_case_name = ""
+        sel_scen_label = ""
+        
+        # --- LOGIKA SHARED FILE ---
+        # Cek apakah ada file dari Sidebar?
+        active_file = st.session_state.get('shared_xml_file', None)
+        
+        with col_bha_1:
+            # Jika tidak ada file dari sidebar, tampilkan uploader manual (Fallback)
+            if active_file is None:
+                st.info("Belum ada file di Sidebar. Upload manual di sini:")
+                active_file = st.file_uploader("Upload XML", type=['xml'], key="bha_manual_up")
+            else:
+                st.success(f"📂 Menggunakan file: {active_file.name}")
+            
+            if active_file:
+                # 1. PARSE DATA
+                scen_dict, cases_df, comps_df = parse_scenario_bha_chain(active_file)
                 
-                col_bha_1, col_bha_2 = st.columns([1, 2])
-                
-                selected_comps_df = None
-                sel_case_name = ""
-                sel_scen_label = ""
-                
-                # --- LOGIKA SHARED FILE ---
-                # Cek apakah ada file dari Sidebar?
-                active_file = st.session_state.get('shared_xml_file', None)
-                
-                with col_bha_1:
-                    # Jika tidak ada file dari sidebar, tampilkan uploader manual (Fallback)
-                    if active_file is None:
-                        st.info("Belum ada file di Sidebar. Upload manual di sini:")
-                        active_file = st.file_uploader("Upload XML", type=['xml'], key="bha_manual_up")
-                    else:
-                        st.success(f"📂 Menggunakan file: {active_file.name}")
+                if scen_dict and not cases_df.empty:
+                    st.markdown("---")
                     
-                    if active_file:
-                        # 1. PARSE DATA (Gunakan fungsi parser BHA yang sudah kita buat)
-                        # (Pastikan fungsi 'parse_scenario_bha_chain' sudah ada di utils)
-                        scen_dict, cases_df, comps_df = parse_scenario_bha_chain(active_file)
+                    # 2. AUTO-SELECT SCENARIO DARI SIDEBAR
+                    pre_selected_id = st.session_state.get('selected_scenario_id')
+                    
+                    scen_opts = {name: sid for sid, name in scen_dict.items()}
+                    sorted_scen_names = sorted(list(scen_opts.keys()))
+                    
+                    # Cari index scenario yang cocok dengan Sidebar
+                    default_idx = 0
+                    if pre_selected_id:
+                        target_name = next((name for sid, name in scen_dict.items() if sid == pre_selected_id), None)
+                        if target_name and target_name in sorted_scen_names:
+                            default_idx = sorted_scen_names.index(target_name)
+                    
+                    sel_scen_label = st.selectbox("1️⃣ Pilih Scenario / Plan:", sorted_scen_names, index=default_idx)
+                    sel_scen_id = scen_opts[sel_scen_label]
+                    
+                    # 3. FILTER & SORT CASE
+                    filtered_cases = cases_df[cases_df['scenario_id'] == sel_scen_id].copy()
+                    
+                    if not filtered_cases.empty:
+                        filtered_cases = filtered_cases.sort_values(by='case_name', ascending=True)
                         
-                        if scen_dict and not cases_df.empty:
-                            st.markdown("---")
-                            
-                            # 2. AUTO-SELECT SCENARIO DARI SIDEBAR
-                            # Ambil ID Scenario yang dipilih di Sidebar (jika ada)
-                            pre_selected_id = st.session_state.get('selected_scenario_id')
-                            
-                            scen_opts = {name: sid for sid, name in scen_dict.items()}
-                            sorted_scen_names = sorted(list(scen_opts.keys()))
-                            
-                            # Cari index scenario yang cocok dengan Sidebar
-                            default_idx = 0
-                            if pre_selected_id:
-                                # Cari nama scenario berdasarkan ID
-                                target_name = next((name for sid, name in scen_dict.items() if sid == pre_selected_id), None)
-                                if target_name and target_name in sorted_scen_names:
-                                    default_idx = sorted_scen_names.index(target_name)
-                            
-                            sel_scen_label = st.selectbox("1️⃣ Pilih Scenario / Plan:", sorted_scen_names, index=default_idx)
-                            sel_scen_id = scen_opts[sel_scen_label]
-                            
-                            # 3. FILTER & SORT CASE
-                            filtered_cases = cases_df[cases_df['scenario_id'] == sel_scen_id].copy()
-                            
-                            if not filtered_cases.empty:
-                                filtered_cases = filtered_cases.sort_values(by='case_name', ascending=True)
-                                
-                                case_opts = dict(zip(filtered_cases['case_name'], filtered_cases['assembly_id']))
-                                
-                                sel_case_name = st.selectbox("2️⃣ Pilih BHA Run:", list(case_opts.keys()))
-                                sel_assembly_id = case_opts[sel_case_name]
-                                
-                                # 4. FILTER KOMPONEN
-                                if not comps_df.empty:
-                                    selected_comps_df = comps_df[comps_df['assembly_id'] == sel_assembly_id].copy()
-                                    if not selected_comps_df.empty:
-                                        selected_comps_df = selected_comps_df.drop(columns=['assembly_id'])
-                                else:
-                                    st.warning("Data komponen kosong.")
-                            else:
-                                st.warning("Scenario ini tidak memiliki BHA Run.")
+                        case_opts = dict(zip(filtered_cases['case_name'], filtered_cases['assembly_id']))
+                        
+                        sel_case_name = st.selectbox("2️⃣ Pilih BHA Run:", list(case_opts.keys()))
+                        sel_assembly_id = case_opts[sel_case_name]
+                        
+                        # 4. FILTER KOMPONEN
+                        if not comps_df.empty:
+                            selected_comps_df = comps_df[comps_df['assembly_id'] == sel_assembly_id].copy()
+                            if not selected_comps_df.empty:
+                                selected_comps_df = selected_comps_df.drop(columns=['assembly_id'])
                         else:
-                            st.error("Struktur XML tidak valid.")
-
-                with col_bha_2:
-                    if selected_comps_df is not None and not selected_comps_df.empty:
-                        st.subheader(f"📋 {sel_case_name}")
-                        
-                        # TABEL COMPONENT
-                        st.dataframe(
-                            selected_comps_df,
-                            column_config={
-                                "Description": st.column_config.TextColumn("Description", width="large"),
-                                "Connection": st.column_config.TextColumn("Conn", width="small"),
-                                "OD (in)": st.column_config.NumberColumn("OD", format="%.3f"),
-                                "ID (in)": st.column_config.NumberColumn("ID", format="%.3f"),
-                                "Length": st.column_config.NumberColumn("Len", format="%.2f"),
-                            },
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                        
-                        # TOTAL LENGTH
-                        if 'Length' in selected_comps_df.columns:
-                            t_len = selected_comps_df['Length'].sum()
-                            st.info(f"📏 Total Length: **{t_len:.2f}**")
-
-                        # VISUALISASI 2D (STICK PLOT)
-                        with st.expander("Lihat Visualisasi 2D", expanded=True):
-                            import plotly.graph_objects as go
-                            fig = go.Figure()
-                            depth = 0
-                            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-                            
-                            for idx, row in selected_comps_df.iterrows():
-                                l = row.get('Length', 1)
-                                if l <= 0: l = 0.5
-                                od = row['OD (in)']
-                                name = row['Description']
-                                
-                                fig.add_trace(go.Scatter(
-                                    x=[-od/2, od/2, od/2, -od/2, -od/2],
-                                    y=[depth, depth, depth+l, depth+l, depth],
-                                    fill="toself",
-                                    line=dict(color='black', width=1),
-                                    fillcolor=colors[idx % len(colors)],
-                                    name=name,
-                                    text=f"<b>{name}</b><br>OD: {od}<br>L: {l}",
-                                    hoverinfo='text'
-                                ))
-                                depth += l
-                            
-                            fig.update_layout(
-                                yaxis=dict(autorange="reversed", title="Cumulative Length"),
-                                xaxis=dict(visible=False),
-                                showlegend=False,
-                                height=500,
-                                margin=dict(t=20, b=20),
-                                template="plotly_white"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                    elif selected_comps_df is not None:
-                        st.info("BHA ini tidak memiliki detail komponen.")
+                            st.warning("Data komponen kosong.")
                     else:
-                        st.markdown("""
-                        <div style='text-align: center; color: grey; padding: 50px;'>
-                            <h3>⬅️ Ready</h3>
-                            <p>Silakan pilih Scenario dan Case.</p>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.warning("Scenario ini tidak memiliki BHA Run.")
+                else:
+                    st.error("Struktur XML tidak valid.")
+
+        with col_bha_2:
+            if selected_comps_df is not None and not selected_comps_df.empty:
+                st.subheader(f"📋 {sel_case_name}")
+                
+                # TABEL COMPONENT
+                st.dataframe(
+                    selected_comps_df,
+                    column_config={
+                        "Description": st.column_config.TextColumn("Description", width="large"),
+                        "Connection": st.column_config.TextColumn("Conn", width="small"),
+                        "OD (in)": st.column_config.NumberColumn("OD", format="%.3f"),
+                        "ID (in)": st.column_config.NumberColumn("ID", format="%.3f"),
+                        "Length": st.column_config.NumberColumn("Len", format="%.2f"),
+                        # HAPUS key="ppf", cukup format saja
+                        "Weight (ppf)": st.column_config.NumberColumn("Weight (ppf)", format="%.2f"),
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+                                
+                # TOTAL LENGTH
+                if 'Length' in selected_comps_df.columns:
+                    t_len = selected_comps_df['Length'].sum()
+                    st.info(f"📏 Total Length: **{t_len:.2f}**")
+
+                # VISUALISASI 2D (STICK PLOT)
+                with st.expander("Lihat Visualisasi 2D", expanded=True):
+                    import plotly.graph_objects as go
+                    fig = go.Figure()
+                    depth = 0
+                    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+                    
+                    for idx, row in selected_comps_df.iterrows():
+                        l = row.get('Length', 1)
+                        if l <= 0: l = 0.5
+                        od = row['OD (in)']
+                        name = row['Description']
+                        
+                        fig.add_trace(go.Scatter(
+                            x=[-od/2, od/2, od/2, -od/2, -od/2],
+                            y=[depth, depth, depth+l, depth+l, depth],
+                            fill="toself",
+                            line=dict(color='black', width=1),
+                            fillcolor=colors[idx % len(colors)],
+                            name=name,
+                            text=f"<b>{name}</b><br>OD: {od}<br>L: {l}",
+                            hoverinfo='text'
+                        ))
+                        depth += l
+                    
+                    fig.update_layout(
+                        yaxis=dict(autorange="reversed", title="Cumulative Length"),
+                        xaxis=dict(visible=False),
+                        showlegend=False,
+                        height=500,
+                        margin=dict(t=20, b=20),
+                        template="plotly_white"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                # --- BAGIAN INTEGRASI PDF REPORT ---
+                st.markdown("---")
+                st.subheader("🖨️ Generate PDF Report")
+
+                col_pr1, col_pr2 = st.columns([1, 2])
+
+                with col_pr1:
+                    st.caption("1. Upload Template (PDF)")
+                    template_file = st.file_uploader("Template (Background)", type="pdf", key="tpl_up_tab5")
+
+                with col_pr2:
+                    st.caption("2. Isi Header Laporan")
+                    h_cust = st.text_input("Customer", value="Pertamina Hulu Rokan", key="h_cust")
+                    h_well = st.text_input("Well Name", value="Sumur-X", key="h_well")
+                    h_job = st.text_input("Job Number", value="JOB-2025-001", key="h_job")
+                    
+                    c1, c2 = st.columns(2)
+                    with c1: h_rig = st.text_input("Rig Name", value="Rig-01", key="h_rig")
+                    with c2: h_field = st.text_input("Field Name", value="Minas", key="h_field")
+                
+                # Tombol Generate (Full Width)
+                if template_file and st.button("🚀 Generate & Download PDF", key="btn_gen_pdf"):
+                    try:
+                        # Bungkus header
+                        header_info = {
+                            "customer": h_cust,
+                            "well_name": h_well,
+                            "job_number": h_job,
+                            "rig_name": h_rig,
+                            "field_name": h_field,
+                            "country": "Indonesia"
+                        }
+                        
+                        # Panggil Fungsi Generator (Pastikan sudah diimport)
+                        pdf_bytes = generate_bha_pdf(template_file, header_info, selected_comps_df)
+                        
+                        st.success("✅ PDF Berhasil Dibuat!")
+                        st.download_button(
+                            label="📥 Download PDF",
+                            data=pdf_bytes,
+                            file_name=f"BHA_Report_{h_well}.pdf",
+                            mime="application/pdf"
+                        )
+                    except Exception as e:
+                        st.error(f"Gagal membuat PDF: {e}")
+
+            elif selected_comps_df is not None:
+                st.info("BHA ini tidak memiliki detail komponen.")
+            else:
+                st.markdown("""
+                <div style='text-align: center; color: grey; padding: 50px;'>
+                    <h3>⬅️ Ready</h3>
+                    <p>Silakan pilih Scenario dan Case di sebelah kiri untuk melihat data.</p>
+                </div>
+                """, unsafe_allow_html=True)
