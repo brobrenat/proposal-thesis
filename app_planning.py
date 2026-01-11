@@ -8,6 +8,7 @@ from io import StringIO
 import uuid
 import warnings
 import re
+import xml.etree.ElementTree as ET
 
 warnings.filterwarnings('ignore')
 
@@ -295,76 +296,403 @@ def calculate_economics(df):
     total_md = df['MD'].iloc[-1]
     cost = (total_md * 1500) + ((total_md/10/24) * 50000)
     return cost, total_md/240
-
-def parse_trajectory_data(text_data, rkb, surf_n, surf_e, engine, azi_corr=0.0):
-    if not text_data.strip(): return None
+def parse_hierarchical_case_data(uploaded_file):
+    """
+    Parser Cerdas: Membaca hubungan antara PROJECT -> WELL -> CASE.
+    FIXED: Mengembalikan tuple (DataFrame, Error) agar sesuai dengan caller.
+    """
     try:
-        # 1. SMART PARSER (Detect separator)
-        data = StringIO(text_data)
-        try: df = pd.read_csv(data, sep=None, engine='python') # Auto-detect sep
-        except: 
-            data.seek(0); df = pd.read_csv(data, sep='\t') # Fallback tab
+        tree = ET.parse(uploaded_file)
+        root = tree.getroot()
+        
+        # 1. Dictionary untuk menyimpan NAMA berdasarkan ID
+        well_map = {}
+        project_map = {}
+        
+        # 2. SCANNING TAHAP 1: Cari Nama Project & Well
+        for child in root.findall(".//*"):
+            tag = child.tag.split('}')[-1].upper()
+            attr = {k.lower(): v for k, v in child.attrib.items()}
+            
+            if tag == 'CD_WELL':
+                w_id = attr.get('well_id')
+                w_name = attr.get('well_common_name', attr.get('well_name', w_id))
+                if w_id: well_map[w_id] = w_name
+                
+            elif tag == 'CD_PROJECT':
+                p_id = attr.get('project_id')
+                p_name = attr.get('project_name', p_id)
+                if p_id: project_map[p_id] = p_name
 
-        # 2. CLEAN HEADERS
-        df.columns = df.columns.str.upper().str.replace(r"[\(\[].*?[\)\]]", "", regex=True).str.strip()
-        col_map = {
-            'MEASURED DEPTH':'MD', 'INCLINATION':'Inc', 'AZIMUTH':'Azi', 
-            'TRUE VERTICAL DEPTH':'TVD', 'VERTICAL SECTION':'VS',
-            '+N/S-':'N', '+E/W-':'E', 'NORTH':'N', 'EAST':'E',
-            'MD': 'MD', 'INC': 'Inc', 'AZI': 'Azi'
-        }
-        for c in df.columns:
-            for k, v in col_map.items():
-                if k in c: df.rename(columns={c: v}, inplace=True); break
+        # 3. SCANNING TAHAP 2: Ambil Case dan hubungkan dengan Nama Well
+        cases = []
+        for child in root.findall(".//*"):
+            tag = child.tag.split('}')[-1].upper()
+            
+            if tag == 'CD_CASE':
+                case_data = {k.lower(): v for k, v in child.attrib.items()}
+                
+                # Link ke Well Name
+                w_id_ref = case_data.get('well_id')
+                # Gunakan Unknown jika ID tidak ditemukan di map
+                case_data['well_name_resolved'] = well_map.get(w_id_ref, f"Unknown Well ({w_id_ref})")
+                
+                # Bersihkan tanggal
+                for key, val in case_data.items():
+                    if isinstance(val, str) and val.startswith("{ts"):
+                        case_data[key] = val.replace("{ts '", "").replace("'}", "")
+                
+                if 'case_name' not in case_data:
+                    case_data['case_name'] = "Unnamed Case"
+                    
+                cases.append(case_data)
+        
+        if not cases:
+            return None, "XML valid, tapi tidak ada tag <CD_CASE>."
+            
+        # --- PERBAIKAN UTAMA DI SINI ---
+        # Kembalikan Tuple: (DataFrame, None)
+        return pd.DataFrame(cases), None 
 
-        req = ['MD', 'Inc', 'Azi'] 
-        if not all(c in df.columns for c in req): 
-            return "MISSING_COLS: Required at least MD, Inc, Azi"
+    except Exception as e:
+        return None, str(e)
+def parse_xml_file(uploaded_file):
+    """
+    Universal Parser: WITSML + Landmark EDM.
+    Fitur Baru: Mengabaikan tag CD_ATTACHMENT (Gambar) agar data bersih.
+    """
+    try:
+        tree = ET.parse(uploaded_file)
+        root = tree.getroot()
+        data = []
         
-        # --- AUTO-CALCULATE COORDINATES IF MISSING ---
-        if 'N' not in df.columns or 'E' not in df.columns or 'TVD' not in df.columns:
-            # Apply Azimuth Correction ONLY if re-calculating
-            df['Azi'] = (df['Azi'] + azi_corr) % 360
+        # Keyword kolom yang valid (Data Survey)
+        valid_keys = ['md', 'mdmn', 'measured_depth', 'inclination', 'azimuth', 'tvd', 'disp_ns', 'disp_ew', 'offset_north', 'offset_east']
+
+        for child in root.findall(".//*"):
+            # 1. CEK TAG: Jika ini adalah Attachment/Gambar, LEWATI (SKIP)
+            tag_name = child.tag.split('}')[-1].upper()
+            if 'ATTACHMENT' in tag_name or 'BLOB' in tag_name or 'IMAGE' in tag_name:
+                continue 
+
+            row_data = {}
             
-            df = df.sort_values('MD').reset_index(drop=True)
+            # A. Ambil Attributes (Style EDM)
+            if child.attrib:
+                for k, v in child.attrib.items():
+                    row_data[k.lower()] = v 
+
+            # B. Ambil Child Tags (Style WITSML)
+            if len(child) > 0:
+                for sub in child:
+                    sub_tag = sub.tag.split('}')[-1].lower()
+                    if sub.text:
+                        row_data[sub_tag] = sub.text
             
-            # AUTO-ANCHOR TO SURFACE (Tie-in 0)
-            if df['MD'].iloc[0] > 0:
-                row0 = pd.DataFrame({'MD': [0], 'Inc': [0], 'Azi': [0]})
-                df = pd.concat([row0, df], ignore_index=True)
+            # C. VALIDASI: Apakah baris ini punya data MD/Inc/Azi?
+            keys = row_data.keys()
+            # Harus punya unsur Depth (MD)
+            has_depth = any(k in keys for k in ['md', 'measured_depth', 'mdmn'])
+            # Harus punya unsur Data (Inc/Azi/Coord)
+            has_data = any(k in keys for k in ['inc', 'inclination', 'azimuth', 'offset_north', 'tvd'])
             
-            # RE-COMPUTE using Engine (MCM)
-            df_calc = engine.calculate_trajectory(
-                df['MD'].values, df['Inc'].values, df['Azi'].values,
-                start_n=surf_n, start_e=surf_e, start_tvd=0
-            )
-            
-            df_calc['TVDSS'] = df_calc['TVD'] - rkb
-            return df_calc
+            # Filter tambahan: Jangan ambil baris yang cuma punya ID tapi ga ada angka
+            if has_depth and has_data:
+                data.append(row_data)
+
+        if not data: 
+            return "XML_CLEAN: No valid survey rows found. (Attachments ignored)."
         
-        # If data already has coords, use them but fix headers if needed
-        if 'TVDSS' not in df.columns: df['TVDSS'] = df['TVD'] - rkb
-        if 'VS' not in df.columns: df['VS'] = np.sqrt((df['N'] - surf_n)**2 + (df['E'] - surf_e)**2)
+        df = pd.DataFrame(data)
         
-        if 'DLS' not in df.columns:
-            md_arr = df['MD'].values
-            inc_rad = np.radians(df['Inc'].values)
-            azi_rad = np.radians(df['Azi'].values)
-            dls_arr = np.zeros(len(df))
-            ref_len = 30.0 
-            for i in range(1, len(df)):
-                dL = md_arr[i] - md_arr[i-1]
-                if dL > 0:
-                    arg = np.cos(inc_rad[i]-inc_rad[i-1]) - \
-                          (np.sin(inc_rad[i-1])*np.sin(inc_rad[i])*(1-np.cos(azi_rad[i]-azi_rad[i-1])))
-                    arg = np.clip(arg, -1.0, 1.0)
-                    dls_val = np.degrees(np.arccos(arg)) * (ref_len / dL)
-                    dls_arr[i] = dls_val
-            df['DLS'] = dls_arr
+        # Clean numeric columns
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='ignore')
             
         return df
+        
+    except Exception as e:
+        return f"XML Error: {str(e)}"
+
+def parse_case_data(uploaded_file):
+    """
+    Parser khusus untuk membaca tag <CD_CASE>.
+    Mengambil daftar BHA/Case Design beserta detail operasionalnya.
+    """
+    try:
+        tree = ET.parse(uploaded_file)
+        root = tree.getroot()
+        
+        cases = []
+        
+        # Cari semua tag CD_CASE
+        for child in root.findall(".//*"):
+            tag = child.tag.split('}')[-1].upper()
+            
+            if tag == 'CD_CASE':
+                # Ambil semua atribut secara otomatis
+                case_data = {k.lower(): v for k, v in child.attrib.items()}
+                
+                # Bersihkan format tanggal (misal: {ts '2025...'} -> 2025...)
+                for key, val in case_data.items():
+                    if isinstance(val, str) and val.startswith("{ts"):
+                        case_data[key] = val.replace("{ts '", "").replace("'}", "")
+                
+                # Pastikan ada nama case
+                if 'case_name' not in case_data:
+                    case_data['case_name'] = "Unnamed Case"
+                    
+                cases.append(case_data)
+        
+        if not cases:
+            return None, "Tidak ditemukan tag <CD_CASE> dalam file XML ini."
+            
+        df = pd.DataFrame(cases)
+        return df, None
+
+    except Exception as e:
+        return None, str(e)
+
+def parse_trajectory_data(input_data, rkb, surf_n, surf_e, engine, azi_corr=0.0):
+    try:
+        # --- 1. LOAD DATA ---
+        df = None
+        if isinstance(input_data, pd.DataFrame): df = input_data
+        elif isinstance(input_data, str) and input_data.strip():
+            if any(ord(c) > 127 for c in input_data[:100]): return "ERROR_BINARY"
+            data = StringIO(input_data)
+            try: df = pd.read_csv(data, sep=None, engine='python') 
+            except: data.seek(0); df = pd.read_csv(data, sep='\t')
+        else: return None 
+
+        # --- 2. MAPPING KOLOM (Compass/Landmark Support) ---
+        df.columns = df.columns.str.upper().str.replace(r"[\(\[].*?[\)\]]", "", regex=True).str.strip()
+        
+        col_map = {
+            'MD': 'MD', 'MEASURED DEPTH':'MD', 'DEPTH':'MD',
+            'INC': 'Inc', 'INCLINATION':'Inc', 'ANGLE':'Inc',
+            'AZI': 'Azi', 'AZIMUTH':'Azi', 'DIR':'Azi',
+            'TVD': 'TVD',
+            # Format XML Anda
+            'OFFSET_NORTH': 'N', 'OFFSET_EAST': 'E',
+            'DISP_NS': 'N', 'DISP_EW': 'E',
+            'MAP_NORTH': 'N', 'MAP_EAST': 'E',
+            'MDMN': 'MD', 'INCL': 'Inc', 'AZIM': 'Azi'
+        }
+        
+        new_names = {}
+        for c in df.columns:
+            for k, v in col_map.items():
+                if k == c: new_names[c] = v; break
+                if k in c and len(c) > len(k): new_names[c] = v; break
+        df.rename(columns=new_names, inplace=True)
+        
+        # Hapus kolom ganda hasil rename
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        # --- 3. DATA CLEANING (CRITICAL FIX) ---
+        req = ['MD', 'Inc', 'Azi'] 
+        if not all(c in df.columns for c in req): 
+            return f"MISSING_COLS: {list(df.columns)}"
+        
+        for c in req: df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.dropna(subset=req, inplace=True)
+
+        # >>> FIX BENANG KUSUT DI SINI <<<
+        # 1. Urutkan berdasarkan MD (dari surface ke TD)
+        df = df.sort_values(by='MD', ascending=True)
+        
+        # 2. Hapus duplikat MD (jika ada overlap survey)
+        df = df.drop_duplicates(subset=['MD'], keep='last')
+        
+        # 3. Reset Index biar rapi
+        df = df.reset_index(drop=True)
+        # >>> END FIX <<<
+
+        # --- 4. KALKULASI & VISUALISASI ---
+        df['Azi'] = (df['Azi'] + azi_corr) % 360
+        
+        # Anchor Surface (Jika data mulai dari kedalaman > 0)
+        if df['MD'].iloc[0] > 0: 
+            row0 = pd.DataFrame({'MD':[0],'Inc':[0],'Azi':[0], 'N':[surf_n], 'E':[surf_e], 'TVD':[0]})
+            df = pd.concat([row0, df], ignore_index=True)
+        else:
+            if 'N' not in df.columns: df['N'] = surf_n
+            else: df.loc[df['MD']==0, 'N'] = surf_n
+            if 'E' not in df.columns: df['E'] = surf_e
+            else: df.loc[df['MD']==0, 'E'] = surf_e
+            if 'TVD' not in df.columns: df['TVD'] = 0
+            else: df.loc[df['MD']==0, 'TVD'] = 0
+
+        # Panggil Engine (Resample 1m agar mulus)
+        df_smooth = engine.resample_and_smooth(df, step=1.0)
+        df_smooth['TVDSS'] = df_smooth['TVD'] - rkb
+        
+        return df_smooth
+
     except Exception as e: return str(e)
 
+def parse_scenario_bha_chain(xml_file):
+    """
+    Parser Berjenjang dengan LOOKUP Logic & SORTING:
+    1. Scan CD_SCENARIO & CD_CASE.
+    2. Scan MB_ASSEMBLY_COMP (buat kamus Referensi Nama).
+    3. Scan CD_ASSEMBLY_COMP (simpan sementara + ambil sequence_no).
+    4. Gabungkan (Join) Nama.
+    5. SORTING berdasarkan Sequence Number.
+    """
+    try:
+        xml_file.seek(0)
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        
+        # 1. WADAH DATA
+        scenarios = {}      
+        cases = []          
+        
+        # Temp Storage
+        raw_cd_comps = []   
+        mb_lookup = {}      # Kamus {assembly_comp_id: Description_Text}
+        
+        # 2. SCANNING XML
+        for child in root.findall(".//*"):
+            tag = child.tag.split('}')[-1].upper()
+            attr = {k.lower(): v for k, v in child.attrib.items()}
+            
+            # A. SCENARIO
+            if tag == 'CD_SCENARIO':
+                sid = attr.get('scenario_id')
+                sname = attr.get('name', attr.get('scenario_name', sid))
+                if sid: scenarios[sid] = sname
+            
+            # B. CASE
+            elif tag == 'CD_CASE':
+                sid_ref = attr.get('scenario_id')
+                aid_ref = attr.get('assembly_id')
+                cname = attr.get('case_name', 'Unnamed Case')
+                desc = attr.get('case_description', '')
+                
+                if "Auto created" in desc: continue
+                if "Casing String" in cname and "Run" not in cname: continue
+
+                if sid_ref and aid_ref:
+                    cases.append({
+                        'scenario_id': sid_ref,
+                        'case_name': cname,
+                        'assembly_id': aid_ref
+                    })
+
+            # C. MASTER TABLE (MB_) UNTUK LOOKUP NAMA
+            elif tag == 'MB_ASSEMBLY_COMP':
+                mb_id = attr.get('assembly_comp_id')
+                mb_desc = attr.get('description')
+                if mb_id and mb_desc:
+                    mb_lookup[mb_id] = mb_desc
+
+            # D. DATA KOMPONEN MENTAH (CD_)
+            elif tag in ['CD_ASSEMBLY_COMP', 'CD_ASSEMBLY_COMPONENT', 'CD_DRILL_STRING_COMP']:
+                if attr.get('assembly_id'):
+                    # --- NEW: AMBIL SEQUENCE NO ---
+                    # Kita ubah ke integer agar urutannya benar (1, 2, 10 bukan 1, 10, 2)
+                    try:
+                        seq = int(attr.get('sequence_no', 0))
+                    except ValueError:
+                        seq = 0 # Default jika error/kosong
+                    
+                    # Simpan sequence ke dalam dictionary raw
+                    attr['parsed_seq'] = seq 
+                    raw_cd_comps.append(attr)
+
+        # 3. PROSES PENGGABUNGAN & FINISHING
+        final_components = []
+        
+        for attr in raw_cd_comps:
+            # Logic Lookup Nama (MB Table)
+            link_id = attr.get('assembly_comp_id')
+            if link_id and link_id in mb_lookup:
+                display_name = mb_lookup[link_id] 
+            else:
+                display_name = attr.get('catalog_key_desc', attr.get('component_name', '-'))
+
+            final_components.append({
+                'assembly_id': attr.get('assembly_id'),
+                'Sequence': attr['parsed_seq'],  # <--- Field Baru untuk Sorting
+                'Description': display_name,
+                'Connection': attr.get('connection_name', attr.get('connection_type', '-')),
+                'OD (in)': float(attr.get('od_body', attr.get('body_od', attr.get('od', 0)))),
+                'ID (in)': float(attr.get('id_body', attr.get('body_id', attr.get('id', 0)))),
+                'Length': float(attr.get('element_length', attr.get('length', 0))) 
+            })
+
+        # Konversi ke DataFrame
+        df_comps = pd.DataFrame(final_components)
+        
+        # 4. SORTING LOGIC
+        if not df_comps.empty:
+            # Urutkan berdasarkan Assembly ID dulu, baru Sequence Number
+            df_comps = df_comps.sort_values(by=['assembly_id', 'Sequence'], ascending=[True, True])
+
+        return scenarios, pd.DataFrame(cases), df_comps
+
+    except Exception as e:
+        return {}, pd.DataFrame(), pd.DataFrame()
+
+def get_scenarios_dual_keys(xml_file):
+    """
+    Parser Dual Key:
+    1. Ambil Offset dari 'survey_header_id' (Plan Header).
+    2. Ambil Data Link dari 'def_survey_header_id' (Station Link).
+    """
+    try:
+        xml_file.seek(0)
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        
+        scenarios = {} 
+        header_offsets = {} 
+        
+        # 1. MAPPING HEADER OFFSET (Cari md_min di semua header)
+        for child in root.findall(".//*"):
+            if child.tag.endswith("SURVEY_HEADER"): 
+                attr = {k.lower(): v for k, v in child.attrib.items()}
+                
+                # Bisa jadi survey_header_id atau def_survey_header_id
+                hid = attr.get('survey_header_id', attr.get('def_survey_header_id'))
+                md_min = float(attr.get('md_min', attr.get('tie_on_depth', 0)))
+                
+                if hid:
+                    header_offsets[hid] = abs(md_min) if md_min < 0 else 0
+
+        # 2. SCENARIO DUAL LINKING
+        for child in root.findall(".//*"):
+            if child.tag.endswith("CD_SCENARIO"):
+                attr = {k.lower(): v for k, v in child.attrib.items()}
+                sid = attr.get('scenario_id')
+                sname = attr.get('name', attr.get('scenario_name', sid))
+                
+                # KUNCI 1: UNTUK OFFSET (Plan ID)
+                offset_id = attr.get('survey_header_id')
+                
+                # KUNCI 2: UNTUK DATA POINTS (Definitive ID)
+                # Jika def_id kosong, pakai survey_header_id sebagai fallback
+                station_id = attr.get('def_survey_header_id')
+                if not station_id: station_id = offset_id
+                
+                if sid:
+                    # Ambil Offset menggunakan Kunci 1
+                    val_offset = header_offsets.get(offset_id, 0)
+                    
+                    scenarios[sid] = {
+                        'name': sname,
+                        'id': sid,
+                        'station_link_id': station_id, # ID "E5x0p" (Untuk cari titik)
+                        'offset_val': val_offset       # Nilai 143.xx (Dari ID "upQyP")
+                    }
+
+        return scenarios
+
+    except Exception as e:
+        return {}
 # ==========================================
 # 3. STATE & UI
 # ==========================================
@@ -387,29 +715,124 @@ if 'autofill_data' in st.session_state:
 
 st.sidebar.title("🎛️ DSS Command Center")
 
-# --- AUTO-FILL EXPANDER ---
-with st.sidebar.expander("⚡ Quick Import (Auto-Fill)", expanded=False):
-    st.caption("Paste full data to extract parameters. **Requires: N, E, TVD**")
-    paste_data = st.text_area("Paste Data:", height=100)
-    if st.button("⚡ Extract & Apply"):
-        try:
-            temp_engine = DrillingEngine('Metric', 30.0)
-            df_temp = parse_trajectory_data(paste_data, 0, 0, 0, temp_engine) 
-            if isinstance(df_temp, pd.DataFrame) and {'N', 'E', 'TVD'}.issubset(df_temp.columns):
-                s_n = df_temp['N'].iloc[0]; s_e = df_temp['E'].iloc[0]
-                t_n = df_temp['N'].iloc[-1]; t_e = df_temp['E'].iloc[-1]; t_tvd = df_temp['TVD'].iloc[-1]
-                kop_idx = df_temp[df_temp['Inc'] > 0.5].index
-                e_kop = df_temp['MD'].iloc[kop_idx[0]] if len(kop_idx) > 0 else 0
-                e_hold = df_temp['Inc'].max()
-                st.session_state['autofill_data'] = {
-                    'surf_n': s_n, 'surf_e': s_e, 'tgt_n': t_n, 'tgt_e': t_e, 'tgt_tvdss': t_tvd,
-                    'kop': e_kop, 'hold': e_hold
-                }
-                st.rerun()
-            else:
-                st.error("Missing N/E/TVD for parameter extraction.")
-        except Exception as e: st.error(f"Extraction Failed: {e}")
+# --- SIDEBAR: QUICK IMPORT (INTEGRATED WITH DrillingEngine) ---
+with st.sidebar.expander("⚡ Quick Import (Master)", expanded=True):
+    st.caption("Mode: Auto-Fix using DrillingEngine Class")
+    
+    qi_file = st.file_uploader("Drop XML File", type=['xml'], key="qi_master")
+    selected_scenario_data = None
+    
+    if qi_file:
+        st.session_state['shared_xml_file'] = qi_file
+        
+        # 1. PARSE SCENARIO (Tetap pakai fungsi parser dual key kita)
+        # (Pastikan get_scenarios_dual_keys sudah ada di Utils)
+        scenarios_found = get_scenarios_dual_keys(qi_file)
+        
+        if scenarios_found:
+            opts = {v['name']: k for k, v in scenarios_found.items()}
+            sorted_opts = sorted(list(opts.keys()))
+            
+            sel_label = st.selectbox("Pilih Scenario / Plan:", sorted_opts)
+            sel_sid = opts[sel_label]
+            selected_scenario_data = scenarios_found[sel_sid]
+            
+            # Simpan State
+            st.session_state['selected_scenario_id'] = sel_sid
+            st.session_state['selected_scenario_name'] = selected_scenario_data['name']
+            
+            # Info Offset
+            off = selected_scenario_data['offset_val']
+            st.info(f"📏 Offset: {off:.2f} | Link ID: {selected_scenario_data['station_link_id']}")
+        else:
+            st.error("Scenario tidak ditemukan.")
 
+    st.markdown("---")
+    file_unit = st.radio("Satuan XML:", ["Meter", "Feet"], index=1, horizontal=True)
+
+    if st.button("🚀 Load Visuals"):
+        if not selected_scenario_data:
+            st.error("Pilih Scenario dulu.")
+        else:
+            try:
+                # Setup
+                target_station_id = selected_scenario_data['station_link_id']
+                offset_to_add = selected_scenario_data['offset_val']
+                
+                # 2. PARSE STATIONS (Ambil MD, Inc, Azi saja)
+                qi_file.seek(0)
+                tree = ET.parse(qi_file)
+                root = tree.getroot()
+                
+                data_points = []
+                station_tags = ['CD_DEFINITIVE_SURVEY_STATION', 'CD_TRAJECTORY_STATION', 'CD_SURVEY_STATION']
+                
+                for child in root.findall(".//*"):
+                    tag = child.tag.split('}')[-1].upper()
+                    if tag in station_tags:
+                        attr = {k.lower(): v for k, v in child.attrib.items()}
+                        
+                        pid1 = attr.get('def_survey_header_id')
+                        pid2 = attr.get('survey_header_id')
+                        pid3 = attr.get('trajectory_id')
+                        
+                        if target_station_id in [pid1, pid2, pid3]:
+                            data_points.append({
+                                'MD': float(attr.get('md', 0)),
+                                'Inc': float(attr.get('inc', attr.get('inclination', 0))),
+                                'Azi': float(attr.get('azi', attr.get('azimuth', 0)))
+                            })
+                
+                if data_points:
+                    # Sort data berdasarkan MD
+                    df_raw = pd.DataFrame(data_points).sort_values(by='MD').reset_index(drop=True)
+                    
+                    # 3. USE DrillingEngine UNTUK HITUNG ULANG (MCM)
+                    # Kita panggil class Anda di sini
+                    # Unit 'Metric' dan DLS Ref 30 (Standar)
+                    engine = DrillingEngine('Metric', 30.0)
+                    
+                    # Siapkan input list
+                    mds = df_raw['MD'].tolist()
+                    incs = df_raw['Inc'].tolist()
+                    azis = df_raw['Azi'].tolist()
+                    
+                    # Hitung (Start N/E/TVD = 0)
+                    df_clean = engine.calculate_trajectory(mds, incs, azis, 0, 0, 0)
+                    
+                    # 4. TERAPKAN OFFSET (RKB 143)
+                    if offset_to_add > 0:
+                        st.toast(f"Adding Offset: {offset_to_add:.2f}")
+                        df_clean['MD'] = df_clean['MD'] + offset_to_add
+                        df_clean['TVD'] = df_clean['TVD'] + offset_to_add
+                        df_clean['TVDSS'] = df_clean['TVD'] # Asumsi RKB di 0 relative to offset
+                    
+                    # 5. KONVERSI UNIT (FEET -> METER)
+                    is_feet = (file_unit == "Feet") or (df_clean['MD'].max() > 5000)
+                    if is_feet:
+                        # Konversi semua kolom spasial
+                        for c in ['MD', 'TVD', 'TVDSS', 'N', 'E', 'VS']:
+                            if c in df_clean.columns: df_clean[c] *= 0.3048
+
+                    # 6. UPDATE APP STATE
+                    s_n = df_clean['N'].iloc[0]; s_e = df_clean['E'].iloc[0]
+                    t_n = df_clean['N'].iloc[-1]; t_e = df_clean['E'].iloc[-1]; t_tvd = df_clean['TVD'].iloc[-1]
+                    
+                    st.session_state['autofill_data'] = {'surf_n': s_n, 'surf_e': s_e, 'tgt_n': t_n, 'tgt_e': t_e, 'tgt_tvdss': t_tvd, 'kop': 0, 'hold': 0}
+                    
+                    if 'Plan' in st.session_state['layers']: del st.session_state['layers']['Plan']
+                    st.session_state['layers']['Plan'] = {
+                        'df': df_clean, 'color': '#0052CC', 'show': True, 'type': 'plan', 'name': selected_scenario_data['name']
+                    }
+                    
+                    st.session_state['meta'] = {'rkb': 0, 'surf_n': s_n, 'surf_e': s_e, 'unit': 'Metric', 'planner': SmartPlanner(s_n, s_e, 0, 'Metric')}
+                    
+                    st.success(f"✅ Success using DrillingEngine! Max MD: {df_clean['MD'].max():.2f}")
+                    st.rerun()
+                else:
+                    st.error(f"Station kosong untuk ID: {target_station_id}")
+
+            except Exception as e: st.error(f"Error: {e}")
 # --- UNIT SELECTION ---
 st.sidebar.markdown("---")
 unit_sys = st.sidebar.radio("Units", ["Metric", "Imperial"], horizontal=True)
@@ -564,27 +987,81 @@ if 'Plan' in st.session_state['layers']:
     
     # --- TOP KPI METRICS ---
     with st.container():
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Depth (MD)", f"{df_plan['MD'].iloc[-1]:,.0f} {u_label}", delta="Target Reached" if df_plan['MD'].iloc[-1] > 0 else None)
-        c2.metric("Max Inclination", f"{df_plan['Inc'].max():.2f}°")
-        c3.metric("Est. Cost", f"${cost/1000:,.0f} K")
+        # 1. SIAPKAN DATA
+        # Ambil data KPI dari XML Header (jika ada)
+        kpi = st.session_state.get('current_kpi', {})
+        xml_max_dls = kpi.get('max_dls', 0)
+        xml_tort = kpi.get('tortuosity', 0)
         
+        # Ambil data Plan (Trajectory)
+        final_md = df_plan['MD'].iloc[-1] if not df_plan.empty else 0
+        max_inc = df_plan['Inc'].max() if not df_plan.empty else 0
+        
+        # Hitung Dummy Cost (Jika variabel cost belum didefinisikan, kita buat dummy)
+        # Asumsi cost $1000 per meter
+        cost = final_md * 1000 
+        
+        # 2. HITUNG MIN SEPARATION (Logika Lama Anda)
         min_sep = 9999.0
         if 'Offsets' in st.session_state['layers']:
-            active = [o for o in st.session_state['layers']['Offsets'] if o['show']]
+            active = [o for o in st.session_state['layers']['Offsets'].values() if o['show']]
             if active:
-                p1 = df_plan[['N', 'E', 'TVD']].values
-                for o in active:
-                    p2 = o['df'][['N', 'E', 'TVD']].values
-                    # Downsample for speed if huge
-                    if len(p2)>1000: p2=p2[::5]
-                    # Simple Euclidean distance check
-                    d = np.min(np.linalg.norm(p1[:, None] - p2[None, :], axis=2))
-                    min_sep = min(min_sep, d)
+                try:
+                    p1 = df_plan[['N', 'E', 'TVD']].values
+                    for o in active:
+                        p2 = o['df'][['N', 'E', 'TVD']].values
+                        # Downsample for speed
+                        if len(p2) > 1000: p2 = p2[::10] 
+                        if len(p1) > 1000: p1_s = p1[::10]
+                        else: p1_s = p1
+                        
+                        # Euclidean distance check (Approx)
+                        # Hitung jarak terdekat antar titik
+                        from scipy.spatial.distance import cdist
+                        dists = cdist(p1_s, p2)
+                        current_min = np.min(dists)
+                        min_sep = min(min_sep, current_min)
+                except Exception as e:
+                    pass # Ignore error calculation for UI stability
+
+        # 3. TAMPILKAN 5 KOLOM
+        c1, c2, c3, c4, c5 = st.columns(5)
         
-        c5.metric("Min Separation", f"{min_sep:.1f} m" if min_sep!=9999 else "N/A", 
-                  delta="CRITICAL ALERT" if min_sep<10 else "Safe Zone", 
-                  delta_color="inverse")
+        # C1: Total Depth
+        c1.metric(
+            "Total Depth (MD)", 
+            f"{final_md:,.0f} {u_label}", 
+            delta="Target Reached" if final_md > 0 else None
+        )
+        
+        # C2: Max Inclination
+        c2.metric("Max Inclination", f"{max_inc:.2f}°")
+        
+        # C3: Est. Cost (Kode Lama)
+        c3.metric("Est. Cost", f"${cost/1000:,.0f} K")
+        
+        # C4: Max DLS / Tortuosity (DATA XML BARU)
+        # Kita gabung infonya biar hemat tempat
+        c4.metric(
+            "Max DLS (Header)", 
+            f"{xml_max_dls:.2f}",
+            delta=f"Tort: {xml_tort:.3f}",
+            delta_color="off" # Warna abu-abu netral
+        )
+        
+        # C5: Min Separation (Kode Lama)
+        sep_val = f"{min_sep:.1f} m" if min_sep != 9999.0 else "N/A"
+        sep_state = "CRITICAL" if min_sep < 10 else "Safe"
+        sep_color = "inverse" if min_sep < 10 else "normal"
+        
+        c5.metric(
+            "Min Separation", 
+            sep_val, 
+            delta=sep_state, 
+            delta_color=sep_color
+        )
+        
+    st.markdown("---")
 
     # --- PRESCRIPTION ALERT BANNER ---
     if 'prescription' in st.session_state and st.session_state['layers'].get('Correction', {}).get('show'):
@@ -598,7 +1075,7 @@ if 'Plan' in st.session_state['layers']:
         </div>
         """, unsafe_allow_html=True)
 
-    tab1, tab2, tab3,tab4 = st.tabs(["🌍 3D Trajectory Analysis", "📐 2D Engineering Plots", "📋 Raw Survey Data","📈 Drilling Mechanics Logs"])
+    tab1, tab2, tab3,tab4,tab5= st.tabs(["🌍 3D Trajectory Analysis", "📐 2D Engineering Plots", "📋 Raw Survey Data","📈 Drilling Mechanics Logs","🗂️ BHA & Case Manager"])
     
     # --- COLOR PALETTE ---
     palette = {
@@ -876,4 +1353,142 @@ if 'Plan' in st.session_state['layers']:
             st.plotly_chart(fig_eng, use_container_width=True)
         else:
             st.info("Generate a trajectory to view engineering logs.")
-        
+
+        with tab5:
+                st.header("🔧 BHA & Assembly Viewer")
+                st.caption("Auto-link dengan file dari Quick Import.")
+                
+                col_bha_1, col_bha_2 = st.columns([1, 2])
+                
+                selected_comps_df = None
+                sel_case_name = ""
+                sel_scen_label = ""
+                
+                # --- LOGIKA SHARED FILE ---
+                # Cek apakah ada file dari Sidebar?
+                active_file = st.session_state.get('shared_xml_file', None)
+                
+                with col_bha_1:
+                    # Jika tidak ada file dari sidebar, tampilkan uploader manual (Fallback)
+                    if active_file is None:
+                        st.info("Belum ada file di Sidebar. Upload manual di sini:")
+                        active_file = st.file_uploader("Upload XML", type=['xml'], key="bha_manual_up")
+                    else:
+                        st.success(f"📂 Menggunakan file: {active_file.name}")
+                    
+                    if active_file:
+                        # 1. PARSE DATA (Gunakan fungsi parser BHA yang sudah kita buat)
+                        # (Pastikan fungsi 'parse_scenario_bha_chain' sudah ada di utils)
+                        scen_dict, cases_df, comps_df = parse_scenario_bha_chain(active_file)
+                        
+                        if scen_dict and not cases_df.empty:
+                            st.markdown("---")
+                            
+                            # 2. AUTO-SELECT SCENARIO DARI SIDEBAR
+                            # Ambil ID Scenario yang dipilih di Sidebar (jika ada)
+                            pre_selected_id = st.session_state.get('selected_scenario_id')
+                            
+                            scen_opts = {name: sid for sid, name in scen_dict.items()}
+                            sorted_scen_names = sorted(list(scen_opts.keys()))
+                            
+                            # Cari index scenario yang cocok dengan Sidebar
+                            default_idx = 0
+                            if pre_selected_id:
+                                # Cari nama scenario berdasarkan ID
+                                target_name = next((name for sid, name in scen_dict.items() if sid == pre_selected_id), None)
+                                if target_name and target_name in sorted_scen_names:
+                                    default_idx = sorted_scen_names.index(target_name)
+                            
+                            sel_scen_label = st.selectbox("1️⃣ Pilih Scenario / Plan:", sorted_scen_names, index=default_idx)
+                            sel_scen_id = scen_opts[sel_scen_label]
+                            
+                            # 3. FILTER & SORT CASE
+                            filtered_cases = cases_df[cases_df['scenario_id'] == sel_scen_id].copy()
+                            
+                            if not filtered_cases.empty:
+                                filtered_cases = filtered_cases.sort_values(by='case_name', ascending=True)
+                                
+                                case_opts = dict(zip(filtered_cases['case_name'], filtered_cases['assembly_id']))
+                                
+                                sel_case_name = st.selectbox("2️⃣ Pilih BHA Run:", list(case_opts.keys()))
+                                sel_assembly_id = case_opts[sel_case_name]
+                                
+                                # 4. FILTER KOMPONEN
+                                if not comps_df.empty:
+                                    selected_comps_df = comps_df[comps_df['assembly_id'] == sel_assembly_id].copy()
+                                    if not selected_comps_df.empty:
+                                        selected_comps_df = selected_comps_df.drop(columns=['assembly_id'])
+                                else:
+                                    st.warning("Data komponen kosong.")
+                            else:
+                                st.warning("Scenario ini tidak memiliki BHA Run.")
+                        else:
+                            st.error("Struktur XML tidak valid.")
+
+                with col_bha_2:
+                    if selected_comps_df is not None and not selected_comps_df.empty:
+                        st.subheader(f"📋 {sel_case_name}")
+                        
+                        # TABEL COMPONENT
+                        st.dataframe(
+                            selected_comps_df,
+                            column_config={
+                                "Description": st.column_config.TextColumn("Description", width="large"),
+                                "Connection": st.column_config.TextColumn("Conn", width="small"),
+                                "OD (in)": st.column_config.NumberColumn("OD", format="%.3f"),
+                                "ID (in)": st.column_config.NumberColumn("ID", format="%.3f"),
+                                "Length": st.column_config.NumberColumn("Len", format="%.2f"),
+                            },
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        
+                        # TOTAL LENGTH
+                        if 'Length' in selected_comps_df.columns:
+                            t_len = selected_comps_df['Length'].sum()
+                            st.info(f"📏 Total Length: **{t_len:.2f}**")
+
+                        # VISUALISASI 2D (STICK PLOT)
+                        with st.expander("Lihat Visualisasi 2D", expanded=True):
+                            import plotly.graph_objects as go
+                            fig = go.Figure()
+                            depth = 0
+                            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+                            
+                            for idx, row in selected_comps_df.iterrows():
+                                l = row.get('Length', 1)
+                                if l <= 0: l = 0.5
+                                od = row['OD (in)']
+                                name = row['Description']
+                                
+                                fig.add_trace(go.Scatter(
+                                    x=[-od/2, od/2, od/2, -od/2, -od/2],
+                                    y=[depth, depth, depth+l, depth+l, depth],
+                                    fill="toself",
+                                    line=dict(color='black', width=1),
+                                    fillcolor=colors[idx % len(colors)],
+                                    name=name,
+                                    text=f"<b>{name}</b><br>OD: {od}<br>L: {l}",
+                                    hoverinfo='text'
+                                ))
+                                depth += l
+                            
+                            fig.update_layout(
+                                yaxis=dict(autorange="reversed", title="Cumulative Length"),
+                                xaxis=dict(visible=False),
+                                showlegend=False,
+                                height=500,
+                                margin=dict(t=20, b=20),
+                                template="plotly_white"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                    elif selected_comps_df is not None:
+                        st.info("BHA ini tidak memiliki detail komponen.")
+                    else:
+                        st.markdown("""
+                        <div style='text-align: center; color: grey; padding: 50px;'>
+                            <h3>⬅️ Ready</h3>
+                            <p>Silakan pilih Scenario dan Case.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
