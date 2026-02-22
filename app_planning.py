@@ -14,10 +14,21 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from pypdf import PdfReader, PdfWriter
 from datetime import datetime # Import datetime untuk Created On
+import joblib
 
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="DSS Well Master Ultimate", layout="wide", page_icon="🏗️")
+
+@st.cache_resource
+def load_drilling_model():
+    try:
+        return joblib.load('c:/Users/brain/antigravity/proposal-thesis/drilling_model.pkl')
+    except Exception as e:
+        st.error(f"Failed to load AI model: {e}")
+        return None
+
+drilling_model = load_drilling_model()
 
 # ==========================================
 # 1. ENGINE & LOGIC (HI-RES UPGRADE)
@@ -539,103 +550,146 @@ def parse_trajectory_data(input_data, rkb, surf_n, surf_e, engine, azi_corr=0.0)
 
 def parse_scenario_bha_chain(xml_file):
     """
-    Parser Berjenjang dengan LOOKUP Logic & SORTING:
-    UPDATE: Menambahkan kolom 'Weight (ppf)' dari attribute 'approximate_weight'.
+    Parser Berjenjang UPDATE (Stab Lookup Fix):
+    1. Scan CD_BHA_COMP_STAB untuk mendapatkan 'stab_blade_od'.
+    2. Logic Gauge: Prioritas UTAMA ambil dari stab_blade_od jika ID cocok.
+    3. Logic Dimensi Lain: Tetap seperti sebelumnya (Fishneck ID, Feet-to-Meter).
     """
     try:
         xml_file.seek(0)
         tree = ET.parse(xml_file)
         root = tree.getroot()
         
-        # 1. WADAH DATA
         scenarios = {}      
         cases = []          
-        
-        # Temp Storage
         raw_cd_comps = []   
-        mb_lookup = {}      # Kamus {assembly_comp_id: Description_Text}
+        mb_lookup = {}      
         
-        # 2. SCANNING XML
+        # --- NEW: KAMUS KHUSUS STABILIZER ---
+        # Format: { 'assembly_comp_id': 15.75 }
+        stab_lookup = {} 
+
+        # --- SCANNING XML ---
         for child in root.findall(".//*"):
             tag = child.tag.split('}')[-1].upper()
             attr = {k.lower(): v for k, v in child.attrib.items()}
             
-            # A. SCENARIO
             if tag == 'CD_SCENARIO':
                 sid = attr.get('scenario_id')
                 sname = attr.get('name', attr.get('scenario_name', sid))
                 if sid: scenarios[sid] = sname
             
-            # B. CASE
             elif tag == 'CD_CASE':
                 sid_ref = attr.get('scenario_id')
                 aid_ref = attr.get('assembly_id')
                 cname = attr.get('case_name', 'Unnamed Case')
                 desc = attr.get('case_description', '')
-                
                 if "Auto created" in desc: continue
                 if "Casing String" in cname and "Run" not in cname: continue
-
                 if sid_ref and aid_ref:
-                    cases.append({
-                        'scenario_id': sid_ref,
-                        'case_name': cname,
-                        'assembly_id': aid_ref
-                    })
+                    cases.append({'scenario_id': sid_ref, 'case_name': cname, 'assembly_id': aid_ref})
 
-            # C. MASTER TABLE (MB_) UNTUK LOOKUP NAMA
             elif tag == 'MB_ASSEMBLY_COMP':
                 mb_id = attr.get('assembly_comp_id')
                 mb_desc = attr.get('description')
-                if mb_id and mb_desc:
-                    mb_lookup[mb_id] = mb_desc
+                if mb_id and mb_desc: mb_lookup[mb_id] = mb_desc
 
-            # D. DATA KOMPONEN MENTAH (CD_)
+            # --- DETEKSI DATA SPESIFIK STABILIZER ---
+            elif tag == 'CD_BHA_COMP_STAB':
+                s_id = attr.get('assembly_comp_id')
+                # Ambil stab_blade_od
+                s_od = float(attr.get('stab_blade_od', 0))
+                
+                if s_id and s_od > 0:
+                    stab_lookup[s_id] = s_od
+
             elif tag in ['CD_ASSEMBLY_COMP', 'CD_ASSEMBLY_COMPONENT', 'CD_DRILL_STRING_COMP']:
                 if attr.get('assembly_id'):
-                    # AMBIL SEQUENCE NO
-                    try:
-                        seq = int(attr.get('sequence_no', 0))
-                    except ValueError:
-                        seq = 0 
-                    
+                    try: seq = int(attr.get('sequence_no', 0))
+                    except: seq = 0 
                     attr['parsed_seq'] = seq 
                     raw_cd_comps.append(attr)
 
-        # 3. PROSES PENGGABUNGAN & FINISHING
+        # --- PROCESSING DATA ---
         final_components = []
         
         for attr in raw_cd_comps:
-            # Logic Lookup Nama (MB Table)
+            # 1. Lookup Nama
             link_id = attr.get('assembly_comp_id')
-            if link_id and link_id in mb_lookup:
-                display_name = mb_lookup[link_id] 
+            display_name = mb_lookup.get(link_id, attr.get('catalog_key_desc', attr.get('component_name', '-')))
+            
+            # 2. Ambil Dimensi Dasar
+            val_od_body   = float(attr.get('od_body', attr.get('body_od', 0)))
+            val_id_body   = float(attr.get('id_body', attr.get('body_id', 0)))
+            val_fish_od   = float(attr.get('fishneck_od', 0))
+            val_fish_len  = float(attr.get('fishneck_length', 0))
+            type_code     = attr.get('sect_type_code', '').upper()
+
+            # --- LOGIC OD (Tabel) ---
+            # Prioritas: Fishneck OD -> Body OD
+            if val_fish_od > 0:
+                final_od = val_fish_od
             else:
-                display_name = attr.get('catalog_key_desc', attr.get('component_name', '-'))
+                final_od = val_od_body
+
+            # --- LOGIC ID (Tabel) ---
+            # Prioritas: Fishneck Length -> ID Body
+            if val_fish_len > 0:
+                final_id = val_fish_len
+            else:
+                final_id = val_id_body
+
+            # --- LOGIC GAUGE (Critical Update) ---
+            final_gauge = None
+            
+            # CEK 1: Apakah ID komponen ini punya data di tabel CD_BHA_COMP_STAB?
+            if link_id in stab_lookup:
+                final_gauge = stab_lookup[link_id] # Pakai 15.75 dari tabel khusus
+                
+            # CEK 2: Jika tidak, cek apakah dia BIT (PDC/Tri-Cone)
+            elif 'BIT' in type_code or type_code == 'PDC':
+                final_gauge = val_od_body # Bit Gauge = Body OD
+            
+            # CEK 3: Fallback untuk Stabilizer lama (jika tidak ada di tabel STAB)
+            elif type_code in ['IBS', 'SBS', 'STAB', 'REZ']:
+                # Coba cari di atribut biasa (od_blade / blade_od)
+                val_blade_od = float(attr.get('od_blade', attr.get('blade_od', attr.get('od_max', 0))))
+                if val_blade_od > 0:
+                    final_gauge = val_blade_od
+                else:
+                    final_gauge = val_od_body
+
+            # --- LOGIC LENGTH (Feet to Meter) ---
+            raw_len_ft = float(attr.get('element_length', attr.get('length', 0)))
+            len_meter = raw_len_ft * 0.3048
 
             final_components.append({
                 'assembly_id': attr.get('assembly_id'),
-                
-                # PERBAIKAN DI SINI:
-                # Ambil nilainya dulu (attr['parsed_seq']), baru ditambah 1 di luar kurung
-                'Sequence': attr['parsed_seq'] + 1, 
-                
+                'Sequence': attr['parsed_seq'] + 1,
                 'Description': display_name,
-                'Connection': attr.get('connection_name', attr.get('connection_type', '-')),
-                'OD (in)': float(attr.get('od_body', attr.get('body_od', attr.get('od', 0)))),
-                'ID (in)': float(attr.get('id_body', attr.get('body_id', attr.get('id', 0)))),
-                'Length': float(attr.get('element_length', attr.get('length', 0))),
+                'Top Connection': attr.get('connection_name', attr.get('connection_type', '-')),
                 
-                # --- NEW FIELD: APPROXIMATE WEIGHT ---
-                'Weight ': float(attr.get('approximate_weight', 0)) 
+                'OD (in)': final_od,
+                'ID (in)': final_id,
+                'Gauge (in)': final_gauge, # Nilai Gauge sudah benar sekarang
+                
+                'Length': len_meter, 
+                'Weight (ppf)': float(attr.get('approximate_weight', 0)) 
             })
 
-        # Konversi ke DataFrame
         df_comps = pd.DataFrame(final_components)
         
-        # 4. SORTING LOGIC
         if not df_comps.empty:
-            df_comps = df_comps.sort_values(by=['assembly_id', 'Sequence'], ascending=[True, True])
+            # Sort Descending (Besar ke Kecil)
+            df_comps = df_comps.sort_values(by=['assembly_id', 'Sequence'], ascending=[True, False])
+            
+            # Reset Index
+            df_comps = df_comps.reset_index(drop=True)
+            df_comps.insert(0, 'No', df_comps.index + 1)
+            df_comps['No'] = df_comps['No'].astype(str)
+            
+            # ❌ HAPUS BARIS INI:
+            # df_comps['Total (m)'] = df_comps['Length'].cumsum()  <-- HAPUS INI
 
         return scenarios, pd.DataFrame(cases), df_comps
 
@@ -1054,7 +1108,25 @@ with st.sidebar.expander("📉 Actual / Correction"):
                 # UNPACK 5 VARIABLES: df_corr, total_dls, req_bur, best_turn, toolface
                 df_corr, total_dls, req_bur, best_turn, tf = planner.calculate_correction_path(df_act, df_plan, corr_len)
                 st.session_state['layers']['Correction'] = {'df': df_corr, 'color': '#00FF00', 'show': True}
-                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf}
+                
+                # --- AI ADVISORY PREDICTION ---
+                advisory_score = "N/A"
+                if drilling_model is not None and not df_corr.empty:
+                    try:
+                        # Extract features: 'measured_depth', 'inclination', 'azimuth', 'dogleg_severity'
+                        # Assuming DLS is constant for the correction path here, so we map to the required names
+                        features_df = pd.DataFrame({
+                            'measured_depth': df_corr['MD'],
+                            'inclination': df_corr['Inc'],
+                            'azimuth': df_corr['Azi'],
+                            'dogleg_severity': df_corr.get('DLS', total_dls) # Fallback to total_dls if DLS not per-row
+                        })
+                        preds = drilling_model.predict(features_df)
+                        advisory_score = f"{np.mean(preds):.2f}"
+                    except Exception as e:
+                        print("Advisory prediction error:", e)
+                        
+                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf, 'advisory': advisory_score}
             else: st.error(df_act)
 
 # --- OFFSET WELLS ---
@@ -1144,7 +1216,7 @@ if 'Plan' in st.session_state['layers']:
         # 2. HITUNG MIN SEPARATION (Logika Lama Anda)
         min_sep = 9999.0
         if 'Offsets' in st.session_state['layers']:
-            active = [o for o in st.session_state['layers']['Offsets'].values() if o['show']]
+            active = [o for o in st.session_state['layers']['Offsets'] if o['show']]            
             if active:
                 try:
                     p1 = df_plan[['N', 'E', 'TVD']].values
@@ -1206,12 +1278,13 @@ if 'Plan' in st.session_state['layers']:
     # --- PRESCRIPTION ALERT BANNER ---
     if 'prescription' in st.session_state and st.session_state['layers'].get('Correction', {}).get('show'):
         p = st.session_state['prescription']
+        advisory_html = f" | Advisory Score: <b>{p.get('advisory', 'N/A')}</b>" if 'advisory' in p else ""
         st.markdown(f"""
         <div style="padding:15px; background-color:#e6fffa; border-left:5px solid #00b894; border-radius:5px; margin-bottom:20px;">
             <h4 style="margin:0; color:#00695c;">💡 AI Prescriptive Correction</h4>
             <p style="margin:0;">Steering Command: <b>{'BUILD' if p['bur']>0 else 'DROP'} {abs(p['bur']):.2f} {dls_label}</b> | 
             <b>TURN {'RIGHT' if p['turn']>0 else 'LEFT'} {abs(p['turn']):.2f} {dls_label}</b> | 
-            Toolface: <b>{p['tf']:.0f}°</b> over next <b>{p['len']} {u_label}</b></p>
+            Toolface: <b>{p['tf']:.0f}°</b> over next <b>{p['len']} {u_label}</b>{advisory_html}</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1231,19 +1304,33 @@ if 'Plan' in st.session_state['layers']:
         layers = st.session_state['layers']
         
         # --- 1. HELPER TO DRAW WELL PATHS (Uses Scatter3d) ---
+       # --- FUNGSI HELPER PLOT 3D (UPDATED) ---
         def add_3d_trace(df, name, color, width=5, dash='solid', opacity=1.0):
-            # Improved Hover Template
+            # 1. CEK KOLOM DEPTH (Robust Check)
+            # Prioritas: TVDSS -> TVD -> Skip jika tidak ada
+            if 'TVDSS' in df.columns:
+                z_data = df['TVDSS']
+                z_label = "TVDSS"
+            elif 'TVD' in df.columns:
+                z_data = df['TVD']
+                z_label = "TVD"
+            else:
+                st.warning(f"Skipping trace '{name}': No Depth column (TVD/TVDSS) found.")
+                return
+
+            # 2. CONFIG HOVER TEMPLATE
+            # Kita gunakan z_label agar tooltip sesuai datanya (TVD atau TVDSS)
             hover_temp = (
                 "<b>" + name + "</b><br>" +
                 "MD: %{text:.1f}<br>" +
                 "Inc: %{customdata[0]:.2f}°<br>" +
                 "Azi: %{customdata[1]:.2f}°<br>" +
-                "TVDSS: %{z:.1f}"
+                f"{z_label}: %{{z:.1f}}"
             )
             
-            # CRITICAL: Use Scatter3d for Lines
+            # 3. CRITICAL: Use Scatter3d for Lines
             fig3d.add_trace(go.Scatter3d(
-                x=df['E'], y=df['N'], z=df['TVDSS'],
+                x=df['E'], y=df['N'], z=z_data, # <--- Gunakan variabel z_data yg aman
                 mode='lines', 
                 name=name,
                 line=dict(color=color, width=width, dash=dash),
@@ -1253,11 +1340,16 @@ if 'Plan' in st.session_state['layers']:
                 hovertemplate=hover_temp
             ))
             
-            # Add Cone at the Bit (Last Point)
+            # 4. ADD CONE AT THE BIT (Last Point)
             if name in ['Plan', 'Actual', 'Correction']:
-                last = df.iloc[-1]
+                # Ambil koordinat terakhir
+                last_idx = df.index[-1]
+                last_e = df.loc[last_idx, 'E']
+                last_n = df.loc[last_idx, 'N']
+                last_z = z_data.iloc[-1] # <--- Ambil Z terakhir dari data yang aman
+
                 fig3d.add_trace(go.Scatter3d(
-                    x=[last['E']], y=[last['N']], z=[last['TVDSS']],
+                    x=[last_e], y=[last_n], z=[last_z],
                     mode='markers', name=f"{name} TD",
                     marker=dict(size=5, color=color, symbol='diamond'),
                     showlegend=False, hoverinfo='skip'
@@ -1270,7 +1362,7 @@ if 'Plan' in st.session_state['layers']:
         else:
             center_n, center_e = 0, 0
 
-        # CRITICAL: Use Mesh3d for the Surface Plane (No 'mode' argument here)
+        # CRITICAL: Use Mesh3d for the Surface Plane
         fig3d.add_trace(go.Mesh3d(
             x=[center_e-500, center_e+500, center_e+500, center_e-500],
             y=[center_n-500, center_n-500, center_n+500, center_n+500],
@@ -1293,14 +1385,16 @@ if 'Plan' in st.session_state['layers']:
             
         if 'Offsets' in layers:
             for o in layers['Offsets']:
-                if o['show']: add_3d_trace(o['df'], o['name'], o['color'], width=3, dash='solid', opacity=0.6)
+                # Hapus .values() jika error "list object has no attribute values" muncul disini
+                if o['show']: 
+                    add_3d_trace(o['df'], o['name'], o['color'], width=3, dash='solid', opacity=0.6)
 
         # --- 4. LAYOUT SETTINGS ---
         fig3d.update_layout(
             scene=dict(
                 xaxis=dict(title='EAST (+/-)', backgroundcolor="rgb(240, 240, 240)", gridcolor="white", showbackground=True, zerolinecolor="white"),
                 yaxis=dict(title='NORTH (+/-)', backgroundcolor="rgb(240, 240, 240)", gridcolor="white", showbackground=True, zerolinecolor="white"),
-                zaxis=dict(title='TVDSS (Depth)', autorange="reversed", backgroundcolor="rgb(230, 230, 240)", gridcolor="white", showbackground=True, zerolinecolor="white"),
+                zaxis=dict(title='TVD / TVDSS', autorange="reversed", backgroundcolor="rgb(230, 230, 240)", gridcolor="white", showbackground=True, zerolinecolor="white"),
                 aspectmode='data' 
             ),
             margin=dict(l=0, r=0, b=0, t=0),
@@ -1566,22 +1660,67 @@ if 'Plan' in st.session_state['layers']:
             if selected_comps_df is not None and not selected_comps_df.empty:
                 st.subheader(f"📋 {sel_case_name}")
                 
-                # TABEL COMPONENT
+                # --- 1. PERSIAPAN DATA LOKAL ---
+                df_display = selected_comps_df.copy()
+                
+                # Reset Nomor Urut agar mulai dari 1
+                df_display = df_display.reset_index(drop=True)
+                df_display['No'] = (df_display.index + 1).astype(str)
+                
+                # --- 2. HITUNG TOTAL (CUMULATIVE SUM) DISINI ---
+                # Rumus ini sekarang hanya berjalan pada data BHA yang dipilih saja
+                df_display['Total (m)'] = df_display['Length'].cumsum()
+                
+                # --- 3. HITUNG GRAND TOTAL UNTUK FOOTER ---
+                total_len_val = df_display['Length'].sum()
+                
+                # --- 4. BUAT BARIS FOOTER ---
+                footer_data = {
+                    'No': '', 
+                    'Sequence': 9999, 
+                    'Description': 'Total:', 
+                    'Top Connection': '',
+                    'OD (in)': None, 
+                    'ID (in)': None, 
+                    'Gauge (in)': None,
+                    'Length': None,       
+                    'Weight (ppf)': None,
+                    'Total (m)': total_len_val # Total Akhir
+                }
+                
+                footer_row = pd.DataFrame([footer_data])
+                
+                # Gabungkan
+                df_final_view = pd.concat([df_display, footer_row], ignore_index=True)
+                
+                # Rapikan kolom No
+                cols = list(df_final_view.columns)
+                if 'No' in cols:
+                    cols.insert(0, cols.pop(cols.index('No')))
+                    df_final_view = df_final_view[cols]
+
+                # --- 5. TAMPILKAN TABEL ---
                 st.dataframe(
-                    selected_comps_df,
+                    df_final_view,
                     column_config={
+                        "No": st.column_config.TextColumn("No", width="small"),
+                        "Sequence": None, 
+                        "assembly_id": None, 
                         "Description": st.column_config.TextColumn("Description", width="large"),
-                        "Connection": st.column_config.TextColumn("Conn", width="small"),
-                        "OD (in)": st.column_config.NumberColumn("OD", format="%.3f"),
-                        "ID (in)": st.column_config.NumberColumn("ID", format="%.3f"),
-                        "Length": st.column_config.NumberColumn("Len", format="%.2f"),
-                        # HAPUS key="ppf", cukup format saja
+                        "Top Connection": st.column_config.TextColumn("Conn", width="medium"),
+                        "OD (in)": st.column_config.NumberColumn("OD (in)", format="%.3f"),
+                        "ID (in)": st.column_config.NumberColumn("ID (in)", format="%.3f"),
+                        "Gauge (in)": st.column_config.NumberColumn("Gauge (in)", format="%.3f"),
                         "Weight (ppf)": st.column_config.NumberColumn("Weight (ppf)", format="%.2f"),
+                        
+                        # Length & Total (3 Desimal)
+                        "Length": st.column_config.NumberColumn("Length (m)", format="%.3f"),
+                        "Total (m)": st.column_config.NumberColumn("Total (m)", format="%.3f"),
                     },
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
+                    height=500
                 )
-                                
                 # TOTAL LENGTH
                 if 'Length' in selected_comps_df.columns:
                     t_len = selected_comps_df['Length'].sum()
