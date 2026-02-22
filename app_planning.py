@@ -1110,7 +1110,8 @@ with st.sidebar.expander("📉 Actual / Correction"):
                 st.session_state['layers']['Correction'] = {'df': df_corr, 'color': '#00FF00', 'show': True}
                 
                 # --- AI ADVISORY PREDICTION ---
-                advisory_score = "N/A"
+                advisory_score = None
+                max_advisory_score = None
                 if drilling_model is not None and not df_corr.empty:
                     try:
                         # Extract features: 'measured_depth', 'inclination', 'azimuth', 'dogleg_severity'
@@ -1122,11 +1123,12 @@ with st.sidebar.expander("📉 Actual / Correction"):
                             'dogleg_severity': df_corr.get('DLS', total_dls) # Fallback to total_dls if DLS not per-row
                         })
                         preds = drilling_model.predict(features_df)
-                        advisory_score = f"{np.mean(preds):.2f}"
+                        advisory_score = float(np.mean(preds))
+                        max_advisory_score = float(np.max(preds))
                     except Exception as e:
                         print("Advisory prediction error:", e)
                         
-                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf, 'advisory': advisory_score}
+                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf, 'advisory': advisory_score, 'max_advisory': max_advisory_score}
             else: st.error(df_act)
 
 # --- OFFSET WELLS ---
@@ -1278,13 +1280,54 @@ if 'Plan' in st.session_state['layers']:
     # --- PRESCRIPTION ALERT BANNER ---
     if 'prescription' in st.session_state and st.session_state['layers'].get('Correction', {}).get('show'):
         p = st.session_state['prescription']
-        advisory_html = f" | Advisory Score: <b>{p.get('advisory', 'N/A')}</b>" if 'advisory' in p else ""
+        
+        # 1. Ambil nilai rata-rata (Advisory) dan nilai tertinggi (Max Advisory)
+        advisory_val = p.get('advisory', None)
+        max_advisory_val = p.get('max_advisory', advisory_val) # Jika max tidak ada, pakai rata-rata
+        
+        # 2. Logika Keputusan (Traffic Light DSS) berdasarkan NILAI TERTINGGI (Max DTP)
+        status_teks = ""
+        warna_bg = "#e6fffa" # Default Hijau Terang (Aman)
+        warna_border = "#00b894" # Default Hijau Gelap
+        
+        if advisory_val is not None and advisory_val != "N/A":
+            if isinstance(advisory_val, str):
+                try: advisory_val = float(advisory_val)
+                except: advisory_val = 0.0
+            if isinstance(max_advisory_val, str):
+                try: max_advisory_val = float(max_advisory_val)
+                except: max_advisory_val = 0.0
+                
+            # Gunakan nilai MAX sebagai acuan penentu bahaya (Worst-Case Scenario)
+            if max_advisory_val < 1.0:
+                status = "AMAN (ON-TRACK)"
+            elif max_advisory_val < 5.0:
+                status = "WASPADA (WARNING - Pantau BHA)"
+                warna_bg = "#fff3cd"    # Kuning Warning
+                warna_border = "#ffc107"
+            else:
+                status = "BAHAYA (CRITICAL - Risiko Deviasi Tinggi!)"
+                warna_bg = "#f8d7da"    # Merah Danger
+                warna_border = "#dc3545"
+
+            # Format teks yang akan ditampilkan
+            teks_max = f" | Max DTP (Tertinggi): <b style='color:{warna_border};'>{max_advisory_val:.2f} m</b>" if 'max_advisory' in p else ""
+            status_teks = f"🎯 AI Rata-rata DTP: <b>{advisory_val:.2f} m</b>{teks_max} <br> 🚦 Status: <b>{status}</b>"
+        else:
+            status_teks = "🎯 AI Score: N/A"
+
+        # 3. Tampilkan Banner UI
         st.markdown(f"""
-        <div style="padding:15px; background-color:#e6fffa; border-left:5px solid #00b894; border-radius:5px; margin-bottom:20px;">
-            <h4 style="margin:0; color:#00695c;">💡 AI Prescriptive Correction</h4>
-            <p style="margin:0;">Steering Command: <b>{'BUILD' if p['bur']>0 else 'DROP'} {abs(p['bur']):.2f} {dls_label}</b> | 
-            <b>TURN {'RIGHT' if p['turn']>0 else 'LEFT'} {abs(p['turn']):.2f} {dls_label}</b> | 
-            Toolface: <b>{p['tf']:.0f}°</b> over next <b>{p['len']} {u_label}</b>{advisory_html}</p>
+        <div style="padding:15px; background-color:{warna_bg}; border-left:5px solid {warna_border}; border-radius:5px; margin-bottom:20px;">
+            <h4 style="margin:0; color:{warna_border};">💡 AI Prescriptive Correction</h4>
+            <p style="margin:0; margin-top:5px; font-size: 1.1rem;">
+                Geometric Steering: <b>{'BUILD' if p.get('bur',0)>0 else 'DROP'} {abs(p.get('bur',0)):.2f} {dls_label}</b> | 
+                <b>TURN {'RIGHT' if p.get('turn',0)>0 else 'LEFT'} {abs(p.get('turn',0)):.2f} {dls_label}</b> | 
+                Toolface: <b>{p.get('tf',0):.0f}°</b> over next <b>{p.get('len',0)} {u_label}</b>
+            </p>
+            <div style="margin-top:10px; padding-top:10px; border-top:1px dashed {warna_border}; font-size: 1.15rem; color:#333;">
+                {status_teks}
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
