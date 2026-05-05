@@ -15,17 +15,254 @@ from reportlab.lib.pagesizes import A4
 from pypdf import PdfReader, PdfWriter
 from datetime import datetime # Import datetime untuk Created On
 import joblib
+import os
 
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="DSS Well Master Ultimate", layout="wide", page_icon="🏗️")
 
+def parse_casing_od(size_str):
+    """Parse casing OD in inches from size strings like '20"', '9-5/8"', '13-3/8"'."""
+    s = str(size_str).replace('"', '').replace("'", '').strip()
+    if '-' in s:
+        parts = s.split('-', 1)
+        try:
+            whole = float(parts[0])
+            frac_str = parts[1]
+            if '/' in frac_str:
+                num, den = frac_str.split('/')
+                return whole + float(num) / float(den)
+        except Exception:
+            pass
+    if '/' in s:
+        try:
+            num, den = s.split('/')
+            return float(num) / float(den)
+        except Exception:
+            pass
+    try:
+        return float(s)
+    except Exception:
+        return 10.0
+
+SECTION_PALETTE = [
+    {'color': '#555555', 'width': 16, 'label': 'Conductor'},
+    {'color': '#9E9E9E', 'width': 12, 'label': 'Surface Csg'},
+    {'color': '#1565C0', 'width': 9,  'label': 'Interm. Csg'},
+    {'color': '#2E7D32', 'width': 6,  'label': 'Prod. Csg'},
+    {'color': '#8B4513', 'width': 4,  'label': 'Open Hole'},
+]
+
+# Feature names must match exactly what the LSTM model was trained on
+ML_FEATURES = [
+    'measured_depth', 'inclination', 'azimuth', 'dogleg_severity',
+    'delta_inc', 'delta_azi', 'inc_error', 'azi_error',
+    'rolling_dls_mean', 'rolling_inc_std', 'depth_norm',
+    'cumulative_inc', 'section_code', 'dls_vs_plan',
+]
+
+def build_ml_features(df_corr, df_plan):
+    """Build the 14-feature DataFrame the LightGBM model expects."""
+    df = df_corr.reset_index(drop=True)
+    MD  = df['MD'].astype(float)
+    Inc = df['Inc'].astype(float)
+    Azi = df['Azi'].astype(float)
+    DLS = df['DLS'].astype(float) if 'DLS' in df.columns else pd.Series(0.0, index=df.index)
+
+    # Interpolate plan values at each correction MD
+    p_md  = df_plan['MD'].values.astype(float)
+    p_inc = np.interp(MD.values, p_md, df_plan['Inc'].values.astype(float))
+    p_azi = np.interp(MD.values, p_md, df_plan['Azi'].values.astype(float))
+    p_dls_arr = df_plan['DLS'].values.astype(float) if 'DLS' in df_plan.columns else np.zeros(len(df_plan))
+    p_dls = np.interp(MD.values, p_md, p_dls_arr)
+
+    delta_inc = Inc.diff().fillna(0.0)
+    raw_dazi  = Azi.diff().fillna(0.0)
+    # Handle 359→1 wrap-around
+    delta_azi = raw_dazi.apply(lambda x: x - 360 if x > 180 else (x + 360 if x < -180 else x))
+
+    rolling_dls_mean = DLS.rolling(5, min_periods=1).mean()
+    rolling_inc_std  = Inc.rolling(5, min_periods=1).std().fillna(0.0)
+
+    md_range   = MD.max() - MD.min()
+    depth_norm = (MD - MD.min()) / (md_range if md_range > 1e-9 else 1.0)
+    cum_inc    = Inc.cumsum()
+
+    # Section code: 0=Vertical 1=Build 2=Hold 3=Drop
+    g = delta_inc.rolling(3, min_periods=1).mean()
+    sec = pd.Series(2, index=df.index)
+    sec[Inc < 2.0] = 0
+    sec[(Inc >= 2.0) & (g >  0.1)] = 1
+    sec[(Inc >= 2.0) & (g < -0.1)] = 3
+
+    feat = pd.DataFrame({
+        'measured_depth':   MD.values,
+        'inclination':      Inc.values,
+        'azimuth':          Azi.values,
+        'dogleg_severity':  DLS.values,
+        'delta_inc':        delta_inc.values,
+        'delta_azi':        delta_azi.values,
+        'inc_error':        Inc.values - p_inc,
+        'azi_error':        Azi.values - p_azi,
+        'rolling_dls_mean': rolling_dls_mean.values,
+        'rolling_inc_std':  rolling_inc_std.values,
+        'depth_norm':       depth_norm.values,
+        'cumulative_inc':   cum_inc.values,
+        'section_code':     sec.values.astype(float),
+        'dls_vs_plan':      DLS.values - p_dls,
+    })[ML_FEATURES]  # enforce column order
+    return feat.fillna(0.0)
+
+
+def compute_distance_to_plan(df_corr, df_plan):
+    """
+    Compute actual 3D distance (metres) from each correction point to the
+    nearest point on the plan curve.  Returns a numpy array, one value per row.
+    """
+    c = df_corr[['N', 'E', 'TVD']].values.astype(float)
+    p = df_plan[['N', 'E', 'TVD']].values.astype(float)
+    # Downsample correction to at most 200 pts for speed, then interpolate back
+    step = max(1, len(c) // 200)
+    c_s  = c[::step]
+    dists_s = np.array([float(np.min(np.sqrt(np.sum((p - pt)**2, axis=1)))) for pt in c_s])
+    # Interpolate back to full length
+    idx_s  = np.arange(len(c_s)) * step
+    idx_f  = np.arange(len(c))
+    return np.interp(idx_f, idx_s, dists_s)
+
+
+class LSTMAdvisoryModel:
+    """Wraps the Keras LSTM artifact to expose the same predict(feats_df) interface."""
+
+    model_type = 'LSTM'
+
+    def __init__(self, keras_model, scaler, seq_len, n_features):
+        self.model = keras_model
+        self.scaler = scaler
+        self.seq_len = seq_len
+        self.n_features = n_features
+
+    def predict(self, feats_df):
+        X = feats_df.values.astype(np.float32)
+        X_sc = self.scaler.transform(X)
+        n = len(X_sc)
+        seqs = np.zeros((n, self.seq_len, self.n_features), dtype=np.float32)
+        for i in range(n):
+            start = max(0, i - self.seq_len + 1)
+            chunk = X_sc[start : i + 1]
+            seqs[i, -len(chunk):] = chunk
+        return self.model.predict(seqs, verbose=0).flatten()
+
+
+class NumpyLSTMAdvisoryModel:
+    """Pure-numpy LSTM inference — no TensorFlow required.
+
+    Matches the DrillLSTM architecture from train_model_v2.py:
+      LSTM(64, return_sequences=True) → Dropout → BN →
+      LSTM(32, return_sequences=False) → Dropout → BN →
+      Dense(32, relu) → Dense(16, relu) → Dense(1, linear)
+
+    Weight index layout (from model.get_weights()):
+      0-2  : LSTM1 kernel(n,256), recurrent(64,256), bias(256)
+      3-6  : BN1 gamma, beta, moving_mean, moving_var
+      7-9  : LSTM2 kernel(64,128), recurrent(32,128), bias(128)
+      10-13: BN2 gamma, beta, moving_mean, moving_var
+      14-15: Dense(32) kernel, bias
+      16-17: Dense(16) kernel, bias
+      18-19: Dense(1)  kernel, bias
+    """
+
+    model_type = 'LSTM'
+
+    def __init__(self, weights, scaler, seq_len, n_features):
+        self.scaler = scaler
+        self.seq_len = seq_len
+        self.n_features = n_features
+        w = weights
+        self.lstm1 = (w[0].astype(np.float32), w[1].astype(np.float32), w[2].astype(np.float32))
+        self.bn1   = (w[3].astype(np.float32), w[4].astype(np.float32), w[5].astype(np.float32), w[6].astype(np.float32))
+        self.lstm2 = (w[7].astype(np.float32), w[8].astype(np.float32), w[9].astype(np.float32))
+        self.bn2   = (w[10].astype(np.float32), w[11].astype(np.float32), w[12].astype(np.float32), w[13].astype(np.float32))
+        self.d1    = (w[14].astype(np.float32), w[15].astype(np.float32))
+        self.d2    = (w[16].astype(np.float32), w[17].astype(np.float32))
+        self.d3    = (w[18].astype(np.float32), w[19].astype(np.float32))
+
+    @staticmethod
+    def _sigmoid(x):
+        return np.where(x >= 0, 1.0 / (1.0 + np.exp(-x)), np.exp(x) / (1.0 + np.exp(x)))
+
+    @staticmethod
+    def _lstm_fwd(seqs, kernel, rec_kernel, bias, units, return_seq):
+        batch, seq_len, _ = seqs.shape
+        h = np.zeros((batch, units), dtype=np.float32)
+        c = np.zeros((batch, units), dtype=np.float32)
+        sig = NumpyLSTMAdvisoryModel._sigmoid
+        out_h = []
+        for t in range(seq_len):
+            z = seqs[:, t, :] @ kernel + h @ rec_kernel + bias
+            i_g = sig(z[:, :units])
+            f_g = sig(z[:, units:2*units])
+            g_g = np.tanh(z[:, 2*units:3*units])
+            o_g = sig(z[:, 3*units:])
+            c = f_g * c + i_g * g_g
+            h = o_g * np.tanh(c)
+            out_h.append(h)
+        return np.stack(out_h, axis=1) if return_seq else h
+
+    @staticmethod
+    def _bn(x, gamma, beta, mean, var, eps=1e-3):
+        return gamma * (x - mean) / np.sqrt(var + eps) + beta
+
+    def predict(self, feats_df):
+        X_sc = self.scaler.transform(feats_df.values.astype(np.float32))
+        n = len(X_sc)
+        seqs = np.zeros((n, self.seq_len, self.n_features), dtype=np.float32)
+        for i in range(n):
+            start = max(0, i - self.seq_len + 1)
+            chunk = X_sc[start:i + 1]
+            seqs[i, -len(chunk):] = chunk
+
+        x = self._lstm_fwd(seqs, *self.lstm1, units=64, return_seq=True)
+        x = self._bn(x, *self.bn1)
+        x = self._lstm_fwd(x, *self.lstm2, units=32, return_seq=False)
+        x = self._bn(x, *self.bn2)
+        x = np.maximum(0.0, x @ self.d1[0] + self.d1[1])
+        x = np.maximum(0.0, x @ self.d2[0] + self.d2[1])
+        x = x @ self.d3[0] + self.d3[1]
+        return x.flatten()
+
+
 @st.cache_resource
 def load_drilling_model():
+    base = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base, 'lstm_model.joblib')
+
+    # Try TensorFlow-backed loading first (Python ≤ 3.12)
     try:
-        return joblib.load('c:/Users/brain/antigravity/proposal-thesis/drilling_model.pkl')
+        import tensorflow as tf
+        artifact = joblib.load(model_path)
+        keras_model = tf.keras.models.model_from_json(artifact['model_config'])
+        keras_model.set_weights(artifact['model_weights'])
+        return LSTMAdvisoryModel(
+            keras_model=keras_model,
+            scaler=artifact['scaler'],
+            seq_len=artifact['seq_len'],
+            n_features=len(artifact['feature_names']),
+        )
+    except Exception:
+        pass
+
+    # Fallback: pure-numpy inference (Python 3.13+, no TensorFlow)
+    try:
+        artifact = joblib.load(model_path)
+        return NumpyLSTMAdvisoryModel(
+            weights=artifact['model_weights'],
+            scaler=artifact['scaler'],
+            seq_len=artifact['seq_len'],
+            n_features=len(artifact['feature_names']),
+        )
     except Exception as e:
-        st.error(f"Failed to load AI model: {e}")
+        st.error(f"Failed to load LSTM model: {e}")
         return None
 
 drilling_model = load_drilling_model()
@@ -215,50 +452,131 @@ class SmartPlanner:
         df['Section'] = 'Plan'; df['TVDSS'] = df['TVD'] - rkb_val
         return df, azi, hold_inc
 
-    def calculate_correction_path(self, actual_df, plan_df, correction_len):
-        # ... (Logika solver correction sama seperti sebelumnya, tapi kita akan resample outputnya)
+    def calculate_correction_path(self, actual_df, plan_df, model=None):
+        """
+        Find the correction path that MINIMISES predicted distance_to_plan.
+
+        Architecture:
+          1. Compute geometric direct-intercept as initial (bur0, tr0).
+          2. If model available: optimise (bur, tr) so that the ML-predicted
+             distance_to_plan is minimised across the entire correction path.
+             The ML model IS the objective – geometry is only a constraint.
+          3. Generate final 1 m-resolution path with best (bur, tr).
+        """
         last = actual_df.iloc[-1]
-        tgt_md = last['MD'] + correction_len
-        seg = plan_df[plan_df['MD'] >= tgt_md]
-        tgt_row = seg.iloc[0] if not seg.empty else plan_df.iloc[-1]
-        
-        # Solver (Low Res for Speed)
-        tgt_pos = np.array([tgt_row['N'], tgt_row['E'], tgt_row['TVD']])
-        start_pos = np.array([last['N'], last['E'], last['TVD']])
-        def sim(p):
-            b, t = p; s = correction_len/5.0
-            cn, ce, ct = start_pos; ci, ca = last['Inc'], last['Azi']
-            di, da = (b/self.dls_ref)*s, (t/self.dls_ref)*s
-            for _ in range(5):
-                ai=np.radians(ci+di/2); aa=np.radians(ca+da/2)
-                ct+=s*np.cos(ai); cn+=s*np.sin(ai)*np.cos(aa); ce+=s*np.sin(ai)*np.sin(aa)
-                ci+=di; ca+=da
-            return np.sum((np.array([cn,ce,ct])-tgt_pos)**2)
-        
-        res = minimize(sim, [0,0], bounds=[(-15,15),(-15,15)], method='Nelder-Mead')
-        best_b, best_t = res.x
-        
-        # Generate Detail Path (HI-RES)
-        # UPDATE: STEP SIZE 1.0
-        step = 1.0; n_steps = max(1, int(correction_len/step))
-        mds, incs, azis = [last['MD']], [last['Inc']], [last['Azi']]
-        di = (best_b/self.dls_ref)*step
-        da = (best_t/self.dls_ref)*step
-        
-        for _ in range(n_steps):
-            mds.append(mds[-1]+step); incs.append(incs[-1]+di); azis.append(azis[-1]+da)
-            
-        df = self.engine.calculate_trajectory(mds, incs, azis, last['N'], last['E'], last['TVD'])
-        
-        f = self.ft_to_m if self.unit=='Imperial' else 1.0
-        df['TVDSS'] = df['TVD'] - (self.rkb * f)
-        if self.unit == 'Imperial': df['TVDSS'] /= self.ft_to_m
-        df['Section'] = 'Correction'
-        
-        avg_inc = np.radians(last['Inc'])
-        tot_dls = np.sqrt(best_b**2 + (best_t * np.sin(avg_inc))**2)
-        tf = np.degrees(np.arctan2(best_t, best_b)) % 360
-        return df, tot_dls, best_b, best_t, tf
+        f    = self.ft_to_m if self.unit == 'Imperial' else 1.0
+
+        N_c, E_c, TVD_c = float(last['N']), float(last['E']), float(last['TVD'])
+        inc_c, azi_c, MD_c = float(last['Inc']), float(last['Azi']), float(last['MD'])
+
+        tgt  = plan_df.iloc[-1]
+        N_t, E_t, TVD_t = float(tgt['N']), float(tgt['E']), float(tgt['TVD'])
+
+        # ── Geometric initial guess ───────────────────────────────────────────
+        dN, dE, dTVD = N_t - N_c, E_t - E_c, TVD_t - TVD_c
+        HD      = float(np.sqrt(dN**2 + dE**2))
+        req_azi = float(np.degrees(np.arctan2(dE, dN)) % 360)
+        req_inc = float(np.clip(np.degrees(np.arctan2(HD, max(dTVD, 0.1))), 0.0, 85.0))
+
+        d_inc = req_inc - inc_c
+        d_azi = float(((req_azi - azi_c + 180) % 360) - 180)
+
+        dls_budget  = max(self.dls_ref * 0.4, 0.5)
+        avg_inc_mid = float(np.sin(np.radians(inc_c + d_inc / 2.0)))
+        build_len   = max(
+            abs(d_inc)  / (dls_budget / 30.0),
+            abs(d_azi * avg_inc_mid) / (dls_budget / 30.0),
+            30.0,
+        )
+        bur0 = d_inc / max(build_len / 30.0, 1e-9)
+        tr0  = d_azi / max(build_len / 30.0, 1e-9)
+
+        # ── Candidate-path generator (coarse step for speed) ─────────────────
+        def _gen(bur, tr, step=8.0):
+            n_b  = max(1, int(build_len / step))
+            di_b = (bur / 30.0) * step
+            da_b = (tr  / 30.0) * step
+            ms, ii, aa = [MD_c], [inc_c], [azi_c]
+            for _ in range(n_b):
+                ms.append(ms[-1] + step)
+                ii.append(float(np.clip(ii[-1] + di_b, 0.0, 90.0)))
+                aa.append((aa[-1] + da_b) % 360.0)
+
+            # Re-aim from build end to final target and hold
+            df_b  = self.engine.calculate_trajectory(ms, ii, aa, N_c, E_c, TVD_c)
+            TVD_b = float(df_b['TVD'].iloc[-1])
+            N_b   = float(df_b['N'].iloc[-1])
+            E_b   = float(df_b['E'].iloc[-1])
+
+            dN2, dE2, dTVD2 = N_t - N_b, E_t - E_b, TVD_t - TVD_b
+            HD2   = float(np.sqrt(dN2**2 + dE2**2))
+            h_azi = float(np.degrees(np.arctan2(dE2, dN2)) % 360)
+            h_inc = float(np.clip(np.degrees(np.arctan2(HD2, max(dTVD2, 0.1))), 0.0, 85.0))
+            h_dst = max(dTVD2 / max(np.cos(np.radians(h_inc)), 0.01), step)
+            n_h   = max(1, int(h_dst / step))
+            # smooth transition over first 30 m of hold
+            ci2, ca2 = ii[-1], aa[-1]
+            fi = (h_inc - ci2) / 30.0
+            fa = float(((h_azi - ca2 + 180) % 360) - 180) / 30.0
+            for k in range(n_h):
+                ms.append(ms[-1] + step)
+                if k < 30:
+                    ci2 = float(np.clip(ci2 + fi, 0.0, 90.0))
+                    ca2 = (ca2 + fa) % 360.0
+                ii.append(ci2); aa.append(ca2)
+
+            df_c = self.engine.calculate_trajectory(ms, ii, aa, N_c, E_c, TVD_c)
+            df_c['TVDSS'] = df_c['TVD'] - (self.rkb * f)
+            if self.unit == 'Imperial':
+                df_c['TVDSS'] /= self.ft_to_m
+            df_c['Section'] = 'Correction'
+            return df_c
+
+        # ── ML-guided optimisation (distance_to_plan is the objective) ────────
+        if model is not None:
+            def objective(params):
+                b, t = float(params[0]), float(params[1])
+                try:
+                    df_c = _gen(b, t)
+                    # Primary: minimise mean ML-predicted distance_to_plan
+                    feats   = build_ml_features(df_c, plan_df)
+                    preds   = np.clip(model.predict(feats), 0.0, None)
+                    ml_cost = float(np.mean(preds))
+
+                    # Constraint: DLS must stay within allowable limit
+                    dls_val     = float(np.sqrt(b**2 + (t * np.sin(np.radians(inc_c)))**2))
+                    dls_penalty = float(max(0.0, dls_val - self.dls_ref) ** 2) * 50.0
+
+                    return ml_cost + dls_penalty
+                except Exception:
+                    return 1e9
+
+            res = minimize(
+                objective, [bur0, tr0],
+                method='Nelder-Mead',
+                bounds=[(-self.dls_ref, self.dls_ref),
+                        (-self.dls_ref, self.dls_ref)],
+                options={'maxiter': 400, 'xatol': 0.05, 'fatol': 0.05},
+            )
+            best_bur, best_tr = float(res.x[0]), float(res.x[1])
+        else:
+            best_bur, best_tr = bur0, tr0
+
+        # ── Final hi-res path (1 m steps) ─────────────────────────────────────
+        df = _gen(best_bur, best_tr, step=1.0)
+        eff_len = float(df['MD'].iloc[-1]) - MD_c
+
+        end = df.iloc[-1]
+        dist_to_final = float(np.sqrt(
+            (float(end['N'])   - N_t) ** 2 +
+            (float(end['E'])   - E_t) ** 2 +
+            (float(end['TVD']) - TVD_t) ** 2
+        ))
+
+        tot_dls = float(np.sqrt(best_bur**2 + (best_tr * np.sin(np.radians(inc_c)))**2))
+        tf      = float(np.degrees(np.arctan2(best_tr, best_bur)) % 360)
+
+        return df, tot_dls, best_bur, best_tr, tf, dist_to_final, eff_len
 
 # ==========================================
 # 2. UPDATED PARSER (WITH AUTO-SMOOTHING)
@@ -1090,46 +1408,56 @@ with st.sidebar.expander("🛠️ Casing & Formation"):
 
 # --- ACTUAL & PRESCRIPTIVE ---
 with st.sidebar.expander("📉 Actual / Correction"):
+    # ML model status indicator
+    if drilling_model is not None:
+        st.success(f"✅ LSTM model loaded ({drilling_model.n_features} features, seq_len={drilling_model.seq_len})")
+    else:
+        st.error("❌ ML model NOT loaded — predictions unavailable")
+
     if st.button("🎲 Demo Actual"):
         st.session_state['act_txt'] = "MD Inc Azi\n0 0 0\n500 0 0\n600 2 45\n1000 12 48"
     act_txt = st.text_area("Actual Data:", value=st.session_state.get('act_txt', ''))
-    corr_len = st.number_input("Correction Len", value=300.0)
-    
-    if st.button("Run Prescription"):
+    st.caption("Path length to target is computed automatically by the ML model.")
+
+    if st.button("🎯 Run Correction to Target", type="primary"):
         if 'Plan' in st.session_state['layers']:
             meta = st.session_state['meta']
             eng = meta['planner'].engine
             df_act = parse_trajectory_data(act_txt, meta['rkb'], meta['surf_n'], meta['surf_e'], eng)
-            
+
             if isinstance(df_act, pd.DataFrame):
                 st.session_state['layers']['Actual'] = {'df': df_act, 'color': '#FF0000', 'show': True}
                 planner = meta['planner']
                 df_plan = st.session_state['layers']['Plan']['df']
-                # UNPACK 5 VARIABLES: df_corr, total_dls, req_bur, best_turn, toolface
-                df_corr, total_dls, req_bur, best_turn, tf = planner.calculate_correction_path(df_act, df_plan, corr_len)
+
+                with st.spinner("Computing ML-guided path to target…"):
+                    df_corr, total_dls, req_bur, best_turn, tf, dist_to_final, corr_len = \
+                        planner.calculate_correction_path(df_act, df_plan, model=drilling_model)
+
                 st.session_state['layers']['Correction'] = {'df': df_corr, 'color': '#00FF00', 'show': True}
-                
-                # --- AI ADVISORY PREDICTION ---
+
+                # Advisory: geometric distance-to-plan (accurate, interpretable)
+                # ML is used inside the optimizer to FIND the best path;
+                # the advisory display uses direct 3D geometry.
                 advisory_score = None
                 max_advisory_score = None
-                if drilling_model is not None and not df_corr.empty:
+                if not df_corr.empty and not df_plan.empty:
                     try:
-                        # Extract features: 'measured_depth', 'inclination', 'azimuth', 'dogleg_severity'
-                        # Assuming DLS is constant for the correction path here, so we map to the required names
-                        features_df = pd.DataFrame({
-                            'measured_depth': df_corr['MD'],
-                            'inclination': df_corr['Inc'],
-                            'azimuth': df_corr['Azi'],
-                            'dogleg_severity': df_corr.get('DLS', total_dls) # Fallback to total_dls if DLS not per-row
-                        })
-                        preds = drilling_model.predict(features_df)
-                        advisory_score = float(np.mean(preds))
-                        max_advisory_score = float(np.max(preds))
+                        dtp = compute_distance_to_plan(df_corr, df_plan)
+                        advisory_score     = float(np.mean(dtp))
+                        max_advisory_score = float(np.max(dtp))
                     except Exception as e:
-                        print("Advisory prediction error:", e)
-                        
-                st.session_state['prescription'] = {'bur': req_bur, 'turn': best_turn, 'dls': total_dls, 'len': corr_len, 'tf': tf, 'advisory': advisory_score, 'max_advisory': max_advisory_score}
-            else: st.error(df_act)
+                        st.warning(f"⚠️ Distance-to-plan computation error: {e}")
+
+                st.session_state['prescription'] = {
+                    'bur': req_bur, 'turn': best_turn, 'dls': total_dls,
+                    'len': round(corr_len, 1), 'tf': tf,
+                    'advisory': advisory_score, 'max_advisory': max_advisory_score,
+                    'dist_to_final': dist_to_final
+                }
+                st.success(f"Path computed: {corr_len:.0f} {u_label} → {dist_to_final:.1f} {u_label} from target")
+            else:
+                st.error(df_act)
 
 # --- OFFSET WELLS ---
 with st.sidebar.expander("🛡️ Offset Wells"):
@@ -1298,36 +1626,76 @@ if 'Plan' in st.session_state['layers']:
                 try: max_advisory_val = float(max_advisory_val)
                 except: max_advisory_val = 0.0
                 
-            # Gunakan nilai MAX sebagai acuan penentu bahaya (Worst-Case Scenario)
-            if max_advisory_val < 1.0:
-                status = "AMAN (ON-TRACK)"
-            elif max_advisory_val < 5.0:
-                status = "WASPADA (WARNING - Pantau BHA)"
-                warna_bg = "#fff3cd"    # Kuning Warning
-                warna_border = "#ffc107"
+            # Distance-to-plan thresholds (metres, geometric)
+            # avg = how far off the correction path deviates on average
+            # max = worst single point deviation along the path
+            # At path END (dist_to_final) it should be near 0 = success
+            if max_advisory_val < 5.0:
+                status    = "🟢 On Track"
+                advice    = "Correction path stays tightly on the planned trajectory."
+                warna_bg  = "#f0fdf4"; warna_border = "#16a34a"
+            elif max_advisory_val < 15.0:
+                status    = "🟡 Minor Deviation"
+                advice    = "Slight divergence during correction — within acceptable steering tolerance."
+                warna_bg  = "#fefce8"; warna_border = "#ca8a04"
+            elif max_advisory_val < 40.0:
+                status    = "🟠 Moderate Deviation"
+                advice    = "Correction path deviates noticeably mid-curve. Verify BUR and toolface orientation."
+                warna_bg  = "#fff7ed"; warna_border = "#ea580c"
+            elif max_advisory_val < 80.0:
+                status    = "🔴 Significant Deviation"
+                advice    = "Large mid-path deviation detected. Consider re-running correction with adjusted DLS."
+                warna_bg  = "#fef2f2"; warna_border = "#dc2626"
             else:
-                status = "BAHAYA (CRITICAL - Risiko Deviasi Tinggi!)"
-                warna_bg = "#f8d7da"    # Merah Danger
-                warna_border = "#dc3545"
+                status    = "⚠️ High Deviation"
+                advice    = "Correction path swings far from plan before reaching target. Review actual survey data and re-plan."
+                warna_bg  = "#fdf4ff"; warna_border = "#9333ea"
 
-            # Format teks yang akan ditampilkan
-            teks_max = f" | Max DTP (Tertinggi): <b style='color:{warna_border};'>{max_advisory_val:.2f} m</b>" if 'max_advisory' in p else ""
-            status_teks = f"🎯 AI Rata-rata DTP: <b>{advisory_val:.2f} m</b>{teks_max} <br> 🚦 Status: <b>{status}</b>"
+            teks_max = (f" &nbsp;|&nbsp; Peak: <b style='color:{warna_border};'>{max_advisory_val:.1f} {u_label}</b>"
+                        if max_advisory_val != advisory_val else "")
+            status_teks = (
+                f"📏 Avg Distance-to-Plan along correction: <b>{advisory_val:.1f} {u_label}</b>{teks_max}<br>"
+                f"<span style='font-size:0.95rem; color:#555;'>{advice}</span><br>"
+                f"🚦 <b>{status}</b>"
+            )
         else:
-            status_teks = "🎯 AI Score: N/A"
+            status_teks = "📏 Distance-to-Plan: computing…"
 
-        # 3. Tampilkan Banner UI
+        # Distance-to-final-target (end of correction → plan TD)
+        dist_final = p.get('dist_to_final', None)
+        if dist_final is not None:
+            if dist_final < 10:
+                dtf_color = "#16a34a"; dtf_icon = "🎯"
+                dtf_label = "Target reached"
+            elif dist_final < 50:
+                dtf_color = "#ca8a04"; dtf_icon = "📍"
+                dtf_label = "Near target"
+            else:
+                dtf_color = "#dc2626"; dtf_icon = "📍"
+                dtf_label = "Still offset"
+            dist_teks = (f"{dtf_icon} End-of-correction distance to target: "
+                         f"<b style='color:{dtf_color};'>{dist_final:.1f} {u_label}</b> — {dtf_label}")
+        else:
+            dist_teks = ""
+
+        # Banner
         st.markdown(f"""
-        <div style="padding:15px; background-color:{warna_bg}; border-left:5px solid {warna_border}; border-radius:5px; margin-bottom:20px;">
-            <h4 style="margin:0; color:{warna_border};">💡 AI Prescriptive Correction</h4>
-            <p style="margin:0; margin-top:5px; font-size: 1.1rem;">
-                Geometric Steering: <b>{'BUILD' if p.get('bur',0)>0 else 'DROP'} {abs(p.get('bur',0)):.2f} {dls_label}</b> | 
-                <b>TURN {'RIGHT' if p.get('turn',0)>0 else 'LEFT'} {abs(p.get('turn',0)):.2f} {dls_label}</b> | 
-                Toolface: <b>{p.get('tf',0):.0f}°</b> over next <b>{p.get('len',0)} {u_label}</b>
+        <div style="padding:16px 20px; background-color:{warna_bg};
+                    border-left:5px solid {warna_border}; border-radius:6px;
+                    margin-bottom:20px; box-shadow:0 1px 4px rgba(0,0,0,0.08);">
+            <h4 style="margin:0 0 8px 0; color:{warna_border};">💡 AI Prescriptive Correction</h4>
+            <p style="margin:0; font-size:1.05rem; line-height:1.6;">
+                <b>{'BUILD' if p.get('bur',0)>0 else 'DROP'}</b> {abs(p.get('bur',0)):.2f} {dls_label} &nbsp;|&nbsp;
+                <b>TURN {'RIGHT' if p.get('turn',0)>0 else 'LEFT'}</b> {abs(p.get('turn',0)):.2f} {dls_label} &nbsp;|&nbsp;
+                Toolface <b>{p.get('tf',0):.0f}°</b> &nbsp;|&nbsp;
+                Correction length <b>{p.get('len',0):.0f} {u_label}</b>
             </p>
-            <div style="margin-top:10px; padding-top:10px; border-top:1px dashed {warna_border}; font-size: 1.15rem; color:#333;">
+            <div style="margin-top:10px; padding-top:10px;
+                        border-top:1px solid {warna_border}33;
+                        font-size:1.0rem; color:#333; line-height:1.7;">
                 {status_teks}
             </div>
+            {f'<div style="margin-top:8px; font-size:0.95rem; color:#444;">{dist_teks}</div>' if dist_teks else ''}
         </div>
         """, unsafe_allow_html=True)
 
@@ -1416,20 +1784,139 @@ if 'Plan' in st.session_state['layers']:
             showlegend=True
         ))
 
-        # --- 3. DRAW LINES ---
-        if layers['Plan']['show']: 
-            add_3d_trace(layers['Plan']['df'], 'Plan', layers['Plan']['color'], width=6)
-            
-        if 'Actual' in layers and layers['Actual']['show']: 
+        # --- 3. DRAW LINES (section-coloured for Plan; standard for others) ---
+
+        def add_casing_shoe_ring_3d(df_traj, shoe_md, ring_r, ring_color, ring_label):
+            """Draw a horizontal ring at a casing shoe depth on the 3D trajectory."""
+            z_col = 'TVDSS' if 'TVDSS' in df_traj.columns else 'TVD'
+            idx = (df_traj['MD'] - shoe_md).abs().idxmin()
+            row = df_traj.iloc[idx]
+            theta = np.linspace(0, 2 * np.pi, 24)
+            fig3d.add_trace(go.Scatter3d(
+                x=row['E'] + ring_r * np.cos(theta),
+                y=row['N'] + ring_r * np.sin(theta),
+                z=[row[z_col]] * 24,
+                mode='lines',
+                line=dict(color=ring_color, width=3),
+                name=ring_label,
+                showlegend=True,
+                hovertemplate=f"{ring_label}<br>MD: {shoe_md:.0f}<extra></extra>"
+            ))
+
+        if layers['Plan']['show']:
+            df_p = layers['Plan']['df']
+            # Build sorted casing list from casing table
+            try:
+                csg_sorted = edited_casing.copy()
+                csg_sorted['_depth'] = pd.to_numeric(csg_sorted['Depth'], errors='coerce').fillna(0)
+                csg_sorted = csg_sorted.sort_values('_depth').reset_index(drop=True)
+            except Exception:
+                csg_sorted = pd.DataFrame()
+
+            # ── Frenet-Serret tube mesh for 3-D casing visualization ──────────────
+            def _tube_3d(df_seg, radius, color, label, n_sides=8):
+                pts_e = df_seg['E'].values.astype(float)
+                pts_n = df_seg['N'].values.astype(float)
+                _zcol = 'TVDSS' if 'TVDSS' in df_seg.columns else 'TVD'
+                pts_z = df_seg[_zcol].values.astype(float)
+                pts = np.column_stack([pts_e, pts_n, pts_z])
+                n_pts = len(pts)
+                if n_pts < 2:
+                    return None
+                if n_pts > 80:
+                    idx_ds = np.round(np.linspace(0, n_pts - 1, 80)).astype(int)
+                    pts = pts[idx_ds]; n_pts = len(pts)
+                # Tangents
+                tg = np.zeros_like(pts)
+                tg[:-1] = pts[1:] - pts[:-1]; tg[-1] = tg[-2]
+                nrm = np.linalg.norm(tg, axis=1, keepdims=True)
+                tg /= np.where(nrm < 1e-10, 1.0, nrm)
+                # Parallel-transport normals (Frenet-Serret)
+                ref = np.array([1., 0., 0.]) if abs(tg[0, 0]) < 0.9 else np.array([0., 1., 0.])
+                nv = np.zeros_like(pts)
+                nv[0] = np.cross(tg[0], ref); nv[0] /= np.linalg.norm(nv[0])
+                for ii in range(1, n_pts):
+                    proj = nv[ii-1] - np.dot(nv[ii-1], tg[ii]) * tg[ii]
+                    pn = np.linalg.norm(proj)
+                    nv[ii] = proj / pn if pn > 1e-10 else nv[ii-1]
+                bv = np.cross(tg, nv)
+                theta = np.linspace(0, 2 * np.pi, n_sides, endpoint=False)
+                ct, st = np.cos(theta), np.sin(theta)
+                vx, vy, vz = [], [], []
+                for ii in range(n_pts):
+                    for jj in range(n_sides):
+                        p = pts[ii] + radius * (ct[jj] * nv[ii] + st[jj] * bv[ii])
+                        vx.append(p[0]); vy.append(p[1]); vz.append(p[2])
+                ti_l, tj_l, tk_l = [], [], []
+                for ii in range(n_pts - 1):
+                    for jj in range(n_sides):
+                        jn = (jj + 1) % n_sides
+                        v00 = ii*n_sides + jj;  v01 = ii*n_sides + jn
+                        v10 = (ii+1)*n_sides + jj; v11 = (ii+1)*n_sides + jn
+                        ti_l += [v00, v00]; tj_l += [v01, v10]; tk_l += [v10, v11]
+                return go.Mesh3d(
+                    x=vx, y=vy, z=vz, i=ti_l, j=tj_l, k=tk_l,
+                    color=color, opacity=0.85,
+                    name=label, showlegend=True, hoverinfo='name',
+                    lighting=dict(ambient=0.7, diffuse=0.9),
+                )
+
+            if not csg_sorted.empty:
+                shoes = list(csg_sorted['_depth'].values)
+                td_md = float(df_p['MD'].max())
+                boundaries = [0.0] + shoes + [td_md]
+
+                for i in range(len(boundaries) - 1):
+                    md_lo, md_hi = boundaries[i], boundaries[i + 1]
+                    seg_df = df_p[(df_p['MD'] >= md_lo) & (df_p['MD'] <= md_hi)]
+                    if seg_df.empty:
+                        continue
+                    style = SECTION_PALETTE[min(i, len(SECTION_PALETTE) - 1)]
+                    sec_label = style['label']
+                    if i < len(csg_sorted):
+                        sec_label = f"{csg_sorted.iloc[i]['Size']} – {style['label']}"
+                    if i < len(csg_sorted):
+                        od_i = parse_casing_od(csg_sorted.iloc[i]['Size'])
+                    else:
+                        od_i = (parse_casing_od(csg_sorted.iloc[-1]['Size']) * 0.85
+                                if not csg_sorted.empty else 8.0)
+                    tube_r = od_i * 0.0254 * 40   # ×40 visual exaggeration
+                    mesh = _tube_3d(seg_df, tube_r, style['color'], sec_label)
+                    if mesh is not None:
+                        fig3d.add_trace(mesh)
+
+                # Shoe rings at section transitions
+                for idx_r, row_r in csg_sorted.iterrows():
+                    od_in = parse_casing_od(row_r['Size'])
+                    ring_r = od_in * 0.0254 * 40
+                    style_r = SECTION_PALETTE[min(idx_r, len(SECTION_PALETTE) - 1)]
+                    add_casing_shoe_ring_3d(df_p, float(row_r['_depth']),
+                                            ring_r, style_r['color'],
+                                            f"Shoe {row_r['Size']} @{row_r['_depth']:.0f}{u_label}")
+            else:
+                add_3d_trace(df_p, 'Plan', layers['Plan']['color'], width=6)
+
+        if 'Actual' in layers and layers['Actual']['show']:
             add_3d_trace(layers['Actual']['df'], 'Actual', layers['Actual']['color'], width=7)
-            
-        if 'Correction' in layers and layers['Correction']['show']: 
-            add_3d_trace(layers['Correction']['df'], 'Correction', layers['Correction']['color'], width=6, dash='dash')
-            
+
+        if 'Correction' in layers and layers['Correction']['show']:
+            add_3d_trace(layers['Correction']['df'], 'Correction',
+                         layers['Correction']['color'], width=6, dash='dash')
+            # Mark the end of the correction path clearly
+            df_corr3d = layers['Correction']['df']
+            z_col3d = 'TVDSS' if 'TVDSS' in df_corr3d.columns else 'TVD'
+            ep = df_corr3d.iloc[-1]
+            fig3d.add_trace(go.Scatter3d(
+                x=[ep['E']], y=[ep['N']], z=[ep[z_col3d]],
+                mode='markers+text',
+                marker=dict(size=8, color='#00C853', symbol='diamond'),
+                text=['End Correction'], textposition='top center',
+                name='Correction End', showlegend=False
+            ))
+
         if 'Offsets' in layers:
             for o in layers['Offsets']:
-                # Hapus .values() jika error "list object has no attribute values" muncul disini
-                if o['show']: 
+                if o['show']:
                     add_3d_trace(o['df'], o['name'], o['color'], width=3, dash='solid', opacity=0.6)
 
         # --- 4. LAYOUT SETTINGS ---
@@ -1525,26 +2012,129 @@ if 'Plan' in st.session_state['layers']:
                 name="VS Direction"
             )
 
-        # Casing & Formation (Logic sama, disesuaikan koordinatnya)
+        # Casing ribbons + shoe markers in Section View
         if not edited_casing.empty and 'Plan' in layers:
             df_p = layers['Plan']['df']
-            # Recalculate VS for Plan just for casing lookup
             vs_p_proj = get_projected_vs(df_p, origin_n, origin_e, vs_azimuth)
-            
-            for _, row in edited_casing.iterrows():
-                try:
-                    d = float(row['Depth'])
-                    idx = (df_p['MD']-d).abs().argsort()[:1]
-                    if not idx.empty:
-                        # Ambil VS dari hasil proyeksi yang sudah dihitung
-                        vs_val = vs_p_proj.iloc[idx].values[0]
-                        tvd_val = df_p['TVDSS'].iloc[idx].values[0]
+
+            try:
+                csg_2d = edited_casing.copy()
+                csg_2d['_depth'] = pd.to_numeric(csg_2d['Depth'], errors='coerce').fillna(0)
+                csg_2d = csg_2d.sort_values('_depth').reset_index(drop=True)
+
+                td_md_2d = float(df_p['MD'].max())
+                boundaries_2d = [0.0] + list(csg_2d['_depth'].values) + [td_md_2d]
+
+                # Visual scale: exaggerate OD so casing is visible against TVD axis
+                # Auto-scale: use 3 % of total VS range per inch of OD
+                vs_range = float(vs_p_proj.max() - vs_p_proj.min())
+                vs_scale = max(vs_range * 0.015, 5.0)   # metres per inch of OD
+
+                # ── Connected tapered wellbore outline ─────────────────────────────
+                # OD per section: [casing_0, ..., casing_n, open_hole]
+                sec_ods_2d = [parse_casing_od(csg_2d.iloc[i2]['Size'])
+                              for i2 in range(len(csg_2d))]
+                oh_od_2d = sec_ods_2d[-1] * 0.85 if sec_ods_2d else 10.0
+                sec_ods_2d.append(oh_od_2d)
+                half_ws_2d = [od * vs_scale / 2.0 for od in sec_ods_2d]
+
+                left_vs_pts, left_tvd_pts = [], []
+                right_vs_pts, right_tvd_pts = [], []
+                prev_hw2d = None
+                center_traces_2d = []
+
+                for i2 in range(len(boundaries_2d) - 1):
+                    lo2, hi2 = boundaries_2d[i2], boundaries_2d[i2 + 1]
+                    mask2 = (df_p['MD'] >= lo2) & (df_p['MD'] <= hi2)
+                    seg2 = df_p[mask2]
+                    if len(seg2) < 1:
+                        continue
+                    hw2 = half_ws_2d[min(i2, len(half_ws_2d) - 1)]
+                    vs_seg = vs_p_proj[mask2].values
+                    tvd_seg = seg2['TVDSS'].values
+                    style2 = SECTION_PALETTE[min(i2, len(SECTION_PALETTE) - 1)]
+                    sec_name2 = (f"{csg_2d.iloc[i2]['Size']} – {style2['label']}"
+                                 if i2 < len(csg_2d) else style2['label'])
+
+                    if prev_hw2d is not None:
+                        # Horizontal step-in at this shoe: from prev width to new width
+                        sv, st_tvd = vs_seg[0], tvd_seg[0]
+                        left_vs_pts.append(sv - hw2);  left_tvd_pts.append(st_tvd)
+                        right_vs_pts.append(sv + hw2); right_tvd_pts.append(st_tvd)
+                        vs_iter = vs_seg[1:]; tvd_iter = tvd_seg[1:]
+                    else:
+                        vs_iter = vs_seg; tvd_iter = tvd_seg
+
+                    for v, t in zip(vs_iter, tvd_iter):
+                        left_vs_pts.append(v - hw2);  left_tvd_pts.append(t)
+                        right_vs_pts.append(v + hw2); right_tvd_pts.append(t)
+
+                    center_traces_2d.append((vs_seg, tvd_seg, style2['color'], sec_name2))
+                    prev_hw2d = hw2
+
+                if left_vs_pts:
+                    # Single closed polygon: left wall down + right wall up
+                    poly_vs  = left_vs_pts  + right_vs_pts[::-1]  + [left_vs_pts[0]]
+                    poly_tvd = left_tvd_pts + right_tvd_pts[::-1] + [left_tvd_pts[0]]
+                    f_sec.add_trace(go.Scatter(
+                        x=poly_vs, y=poly_tvd,
+                        fill='toself',
+                        fillcolor='rgba(180,180,180,0.28)',
+                        line=dict(color='#444444', width=1.5),
+                        mode='lines',
+                        name='Wellbore Outline',
+                        showlegend=True,
+                        hoverinfo='skip',
+                    ))
+
+                # Section centerlines (colored per section, with hover)
+                for vs_s, tvd_s, col_s, name_s in center_traces_2d:
+                    f_sec.add_trace(go.Scatter(
+                        x=vs_s, y=tvd_s,
+                        mode='lines',
+                        line=dict(color=col_s, width=2),
+                        name=name_s,
+                        showlegend=True,
+                        hovertemplate=f"{name_s}<br>VS: %{{x:.1f}}<br>TVD: %{{y:.1f}}<extra></extra>"
+                    ))
+
+                # Casing shoe horizontal markers
+                for _, row_s in csg_2d.iterrows():
+                    try:
+                        d_s = float(row_s['_depth'])
+                        idx_s = (df_p['MD'] - d_s).abs().idxmin()
+                        vs_s  = float(vs_p_proj.loc[idx_s])
+                        tvd_s = float(df_p.loc[idx_s, 'TVDSS'])
+                        od_s  = parse_casing_od(row_s['Size'])
+                        hw_s  = od_s * vs_scale / 2.0
                         f_sec.add_trace(go.Scatter(
-                            x=[vs_val], y=[tvd_val], mode='markers+text',
-                            marker=dict(symbol='triangle-left', size=10, color='black'),
-                            text=[row['Size']], textposition='middle left', showlegend=False
+                            x=[vs_s - hw_s, vs_s + hw_s],
+                            y=[tvd_s, tvd_s],
+                            mode='lines+text',
+                            line=dict(color='black', width=2),
+                            text=[None, f" {row_s['Size']} shoe"],
+                            textposition='middle right',
+                            showlegend=False,
+                            hovertemplate=f"Shoe {row_s['Size']}<br>Depth: {d_s:.0f}{u_label}<extra></extra>"
                         ))
-                except: pass
+                    except Exception:
+                        pass
+            except Exception:
+                # Fallback: simple triangle markers (original behaviour)
+                for _, row_f in edited_casing.iterrows():
+                    try:
+                        d_f = float(row_f['Depth'])
+                        idx_f = (df_p['MD'] - d_f).abs().argsort()[:1]
+                        if not idx_f.empty:
+                            vs_f  = vs_p_proj.iloc[idx_f].values[0]
+                            tvd_f = df_p['TVDSS'].iloc[idx_f].values[0]
+                            f_sec.add_trace(go.Scatter(
+                                x=[vs_f], y=[tvd_f], mode='markers+text',
+                                marker=dict(symbol='triangle-left', size=10, color='black'),
+                                text=[row_f['Size']], textposition='middle left', showlegend=False
+                            ))
+                    except Exception:
+                        pass
         
         # Formation Lines
         try:
@@ -1565,15 +2155,15 @@ if 'Plan' in st.session_state['layers']:
         )
         
         f_sec.update_layout(
-            title=f"Section View (Azimuth: {vs_azimuth:.1f}°)", 
-            xaxis_title=f"Vertical Section at {vs_azimuth:.1f}°", 
-            yaxis_title="TVDSS", 
-            height=600, 
-            yaxis_autorange="reversed", 
-            yaxis_scaleanchor="x", # KUNCI: Biar 100m Depth terlihat sama panjang dengan 100m VS
-            paper_bgcolor='white', plot_bgcolor='white',
-            xaxis=dict(gridcolor='#eee', zeroline=True, zerolinecolor='black'), 
-            yaxis=dict(gridcolor='#eee', zeroline=False)
+            title=f"Section View – Wellbore Schematic (Azimuth: {vs_azimuth:.1f}°)",
+            xaxis_title=f"Vertical Section at {vs_azimuth:.1f}° ({u_label})",
+            yaxis_title=f"TVDSS ({u_label})",
+            height=700,
+            yaxis_autorange="reversed",
+            paper_bgcolor='white', plot_bgcolor='#f8f9fa',
+            xaxis=dict(gridcolor='#dee2e6', zeroline=True, zerolinecolor='black'),
+            yaxis=dict(gridcolor='#dee2e6', zeroline=False),
+            legend=dict(bgcolor='rgba(255,255,255,0.85)', bordercolor='#ccc', borderwidth=1)
         )
         
         c_view.plotly_chart(f_plan, use_container_width=True)
